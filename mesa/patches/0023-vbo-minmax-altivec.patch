@@ -39,7 +39,7 @@ Not built against Mesa or run on Tiger.
 + * AltiVec is switched on for these functions only, with the compiler's
 + * builtins: <altivec.h> would redefine `bool` and `vector`.
 + */
-+#if (defined(__powerpc__) || defined(__ppc__) || defined(_ARCH_PPC)) && \
++#if !defined(RDN_CFM_NO_ALTIVEC) && (defined(__powerpc__) || defined(__ppc__) || defined(_ARCH_PPC)) && \
 +    !defined(__LITTLE_ENDIAN__) && \
 +    defined(__GNUC__) && (__GNUC__ >= 5)
 +#define RDN_ALTIVEC_MINMAX 1

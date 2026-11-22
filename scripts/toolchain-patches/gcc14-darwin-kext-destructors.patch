@@ -1,0 +1,22 @@
+--- a/gcc/config/darwin.cc
++++ b/gcc/config/darwin.cc
+@@ -3925,6 +3925,10 @@
+     {
+       /* -mkernel implies -fapple-kext for C++ */
+       if (lang_GNU_CXX ())
+ 	flag_apple_kext = 1;
++
++      /* Kernel C++ destruction uses the module terminator section, not the
++         process-local __cxa_atexit/__dso_handle interface.  */
++      targetm.dtors_from_cxa_atexit = false;
+ 
+       flag_no_common = 1;
+@@ -4441,7 +4445,7 @@
+      FIXME: there should be some neater way to do this, FIXME we should be able
+      to partition within a section.  */
+-  if (DECL_NAME (decl)
++  if (!flag_mkernel && !flag_apple_kext && DECL_NAME (decl)
+       && (startswith (IDENTIFIER_POINTER (DECL_NAME (decl)), "_GLOBAL__sub_I")
+ 	  || startswith (IDENTIFIER_POINTER (DECL_NAME (decl)),
+ 			 "__static_initialization_and_destruction")))
+     return  darwin_sections[static_init_section];

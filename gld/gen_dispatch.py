@@ -1682,6 +1682,7 @@ static void progparams_local(GLenum target, GLuint index, GLsizei count, const G
 static void *byname_function(const char *name)
 {
 	void *own = NULL;
+	if (!rdn_mesa_owns_current()) return NULL;
 
 	if (name[0] != 'g' || name[1] != 'l')
 		return NULL;
@@ -1708,22 +1709,32 @@ static void *byname_function(const char *name)
  */
 static const char *renderer_name(void)
 {
-	static const char *name;
-	static int asked;
-
-	if (!asked) {
-		asked = 1;
-		name = getenv("RDN_RENDERER");
-		/* RDN_RENDERER= (empty): Mesa's own name. Else the default is the
-		 * name Core Image knows (the user's decision, 2026-10-08). */
-		if (!name && (!rdn_ws_no_core_image()))
-			name = "ATI Radeon HD 7570";
-		if (name && !*name)
-			name = NULL;
-		if (name)
-			rdn_log("GL_RENDERER is \\"%s\\" for this program (RDN_RENDERER)", name);
+	const char *name = getenv("RDN_RENDERER");
+	if (name) return *name ? name : NULL;
+	name = rdn_ws_no_core_image() ? NULL : rdn_context_renderer_name();
+	/* Leopard classifies ATI hardware by the Radeon prefix, excluding FirePro. */
+	if (rdn_window_server && name && !strncmp(name, "ATI FirePro ", 12)) {
+		static __thread char quartz_name[256];
+		snprintf(quartz_name, sizeof(quartz_name), "ATI Radeon (%s)", name + 4);
+		return quartz_name;
 	}
 	return name;
+}
+
+/* Cap the legacy dispatch API while retaining Mesa's build identification. */
+static const GLubyte *legacy_version(const GLubyte *raw, const char *cap,
+                                    unsigned major, unsigned minor)
+{
+	static __thread char versions[2][256];
+	unsigned actual_major = 0, actual_minor = 0;
+	if (!raw || sscanf((const char *)raw, "%u.%u", &actual_major, &actual_minor) != 2)
+		return raw;
+	if (actual_major < major || (actual_major == major && actual_minor <= minor))
+		return raw;
+	const char *build = strstr((const char *)raw, "Mesa ");
+	char *result = versions[major == 1];
+	snprintf(result, 256, "%s%s%s", cap, build ? " " : "", build ? build : "");
+	return (const GLubyte *)result;
 }
 
 /* Names for every program apple_on() is true for. */
@@ -3248,6 +3259,15 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
     for entry_index, (ret, name, params, names) in enumerate(entries):
         full = 'GLIContext ctx' + (', ' + params if params else '')
         call = 'm_%s(%s)' % (name, ', '.join(names))
+        recordable = ret.strip() == 'void' and '*' not in params and '[' not in params and name not in ('new_list', 'end_list')
+        if recordable:
+            fields = '; '.join(x.strip() for x in params.split(',')) if params else 'unsigned char unused'
+            out.append('struct list_args_%s { %s; };' % (name, fields))
+            out.append('static int replay_%s(void *(*lookup)(const char *), const void *data) {' % name)
+            out.append('    const struct list_args_%s *a = data;' % name)
+            out.append('    void (*fn)(%s) = lookup("%s");' % (params or 'void', gl_name(name)))
+            out.append('    if (!fn) return 0;')
+            out.append('    fn(%s); return 1; }' % ', '.join('a->'+n for n in names))
         out.append('static %s t_%s(%s)' % (ret, name, full))
         out.append('{')
         if name != 'copy_tex_sub_image2D':
@@ -3255,6 +3275,16 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
             out.append('\tif (__builtin_expect(rowrun.count, 0))')
             out.append('\t\trowrun_flush_for(ctx);')
         out.append('\tRDN_ENTER(ctx);')
+        if name == 'new_list':
+            out.append('    rdn_list_begin(list, mode);')
+        elif name == 'bitmap':
+            out.append('    if (rdn_list_recording()) rdn_list_bitmap(width, height, xorig, yorig, xmove, ymove, bitmap);')
+        elif name not in ('end_list',) and ret.strip() == 'void':
+            if recordable:
+                out.append('    if (rdn_list_recording()) { struct list_args_%s args = {%s}; rdn_list_record(replay_%s, &args, sizeof(args)); }' % (name, ', '.join(names) if names else '0', name))
+            elif not name.startswith('get_'):
+                out.append('    if (rdn_list_recording()) rdn_list_record(NULL, NULL, 0);')
+
         out.append('\tif (__builtin_expect(call_stats, 0))\n\t\tcall_note(%d);' % entry_index)
         out.extend(lazy_prologue(gl_name(name)))
         if name in bodies:
@@ -3337,9 +3367,9 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
             out.append('\tif (name == 0x1F03 && ext_ours())\t/* GL_EXTENSIONS */')
             out.append('\t\treturn ext_list(m_get_string(name));')
             out.append('\tif (name == 0x1F02 && leopard_gl_compat())\t/* GL_VERSION */')
-            out.append('\t\treturn (const GLubyte *)"2.1 Mesa RadeonNI";')
+            out.append('\t\treturn legacy_version(m_get_string(name), "2.1", 2, 1);')
             out.append('\tif (name == 0x8B8C && leopard_gl_compat())\t/* GL_SHADING_LANGUAGE_VERSION */')
-            out.append('\t\treturn (const GLubyte *)"1.20 Mesa RadeonNI";')
+            out.append('\t\treturn legacy_version(m_get_string(name), "1.20", 1, 20);')
             out.append('\tif (name == 0x1F01 && renderer_name())\t/* GL_RENDERER */')
             out.append('\t\treturn (const GLubyte *)renderer_name();')
         if name == 'bind_buffer':
@@ -3395,6 +3425,8 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
         if framebuffer_change:
             out.append('\tGLint old_x, old_y, new_x, new_y, v[4];')
             out.append('\tdrawable_origin(0, &old_x, &old_y);')
+        if name == 'tex_image2D':
+            out.append('\tif (rdn_window_server && rdn_surface_texture_upload(target, level, internalformat, width, height, border, format, type, pixels)) return;')
         if name in ('tex_image2D', 'tex_sub_image2D'):
             out.append('\tGLint row_bytes = rdn_mesa_unpack_row_bytes(ctx, -1);')
             out.append('\tGLint saved_row = 0, saved_align = 0;')
@@ -3410,10 +3442,18 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
                 out.append('\t\t\tapple_upload_rows(target, level, internalformat, 0, 0, width, height, border, format, type, pixels, row_bytes, 1);')
             else:
                 out.append('\t\t\tapple_upload_rows(target, level, 0, xoffset, yoffset, width, height, 0, format, type, pixels, row_bytes, 0);')
+            out.append('\t\t\trdn_texture_changed(target);')
             out.append('\t\t\treturn;')
             out.append('\t\t}')
             out.append('\t}')
+        if name in ('push_client_attrib', 'pop_client_attrib'):
+            out.append('\tGLint pixel_depth_before=0,pixel_depth_after=0;')
+            out.append('\tm_get_integerv(0x0BB1, &pixel_depth_before);')
         out.append('\t%s%s;' % ('' if ret == 'void' else 'return ', call))
+        if name in ('push_client_attrib', 'pop_client_attrib'):
+            out.append('\tm_get_integerv(0x0BB1, &pixel_depth_after);')
+            out.append('\tint restored=rdn_mesa_unpack_client_attrib(ctx,%s,pixel_depth_before,pixel_depth_after,%d,apple_ctx(ctx)->client_storage);' % ('mask' if name == 'push_client_attrib' else '0', name == 'push_client_attrib'))
+            out.append('\tif(restored>=0)apple_ctx(ctx)->client_storage=restored;')
         if name in ('tex_image2D', 'tex_sub_image2D'):
             out.append('\tif (saved_align) { m_pixel_storei(0x0CF2, saved_row); m_pixel_storei(0x0CF5, saved_align); }')
         if framebuffer_change:
@@ -3424,8 +3464,21 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
             out.append('\t\tm_get_integerv(0x0C10, v);')
             out.append('\t\tm_scissor(v[0] + new_x - old_x, v[1] + new_y - old_y, v[2], v[3]);')
             out.append('\t}')
+        if name == 'end_list':
+            out.append('    rdn_list_end();')
+        if name == 'delete_lists':
+            out.append('    rdn_lists_deleted(list, range);')
         if name in ('flush', 'finish'):
             out.append('\trdn_flush_surface(ctx);')
+        if name == 'bind_texture':
+            out.append('\trdn_texture_bound(target, texture);')
+        if name == 'gen_textures':
+            out.append('\trdn_texture_generated(n, (unsigned *)(void *)textures);')
+        if name == 'delete_textures':
+            out.append('\trdn_texture_deleted(n, (const unsigned *)(const void *)textures);')
+        if name in ('tex_image2D', 'tex_sub_image2D', 'copy_tex_image2D', 'copy_tex_sub_image2D',
+                    'tex_parameterf', 'tex_parameteri', 'tex_parameterfv', 'tex_parameteriv'):
+            out.append('\trdn_texture_changed(target);')
         if name in WATCHED:
             out.append('\tif (__builtin_expect(rdn_watch, 0))')
             out.append('\t\trdn_watch_%s(%s);' % (name, ', '.join(names)))
@@ -3475,7 +3528,7 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
                     ('bind_framebuffer', 'glBindFramebuffer')):
         out.append('\tx_%s = lookup("%s");' % (var, gl))
     out.append('\tbyname = strcmp(getprogname(), "WindowServer") &&')
-    out.append('\t\trdn_hook_function_lookup(byname_function);')
+    out.append('\t\trdn_hook_function_lookup(byname_function, rdn_mesa_lookup_missing);')
     out.append('\tflushrange = byname && x_map_buffer_range && x_flush_mapped_buffer_range &&')
     out.append('\t\t!getenv("RDN_NO_FLUSHRANGE");')
     out.append('\tprogparams = byname && !getenv("RDN_NO_PROGPARAMS");')
@@ -3617,6 +3670,11 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
     out.append('\treturn n;')
     out.append('}')
     out.append('')
+    out.append('int rdn_dispatch_owns(const void *table)')
+    out.append('{')
+    out.append('\tconst GLIFunctionDispatch *disp = table;')
+    out.append('\treturn disp && disp->clear_color == t_clear_color;')
+    out.append('}')
     out.append('const unsigned rdn_dispatch_entries = %d;' % len(entries))
     open(sys.argv[2], 'w').write('\n'.join(out) + '\n')
 

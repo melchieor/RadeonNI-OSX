@@ -10,6 +10,7 @@
 #define GPU_LIMIT (1ull << 40)
 static unsigned checks, failures;
 static uint32_t response, pending_reads, reads, writes, delays, logs;
+static int cayman_register, inaccessible;
 static uint32_t write_offsets[2], write_values[2];
 
 static void check(int passed, const char *name)
@@ -22,6 +23,8 @@ static uint32_t read_reg(void *cookie, uint32_t offset)
 {
     (void)cookie;
     reads++;
+    if (inaccessible) return 0xffffffffu;
+    if (cayman_register && offset == 0x147c) return reads <= pending_reads ? 0 : response;
     if (offset != 0x1470) return 0xffffffffu;
     return reads <= pending_reads ? 0 : response << 4;
 }
@@ -221,6 +224,10 @@ int main(void)
     reset_flush(15, 0);
     check(rdn_gart_flush_checked(&gart) == -EIO && reads == 1 && logs == 1,
           "unknown nonzero TLB response fails closed");
+    reset_flush(1, 0); inaccessible = 1;
+    check(rdn_gart_flush_checked(&gart) == -EIO && reads == 1,
+          "inaccessible Evergreen register cannot confirm flush");
+    inaccessible = 0;
     reset_flush(0, 0);
     check(rdn_gart_flush_checked(&gart) == -ETIMEDOUT && reads == 100000 &&
           delays == 100000 && writes == 2 && logs == 1, "TLB timeout is finite and observable");
@@ -234,6 +241,15 @@ int main(void)
     check(rdn_gart_flush_checked(&gart) == -EINVAL && !writes && !reads,
           "missing callback rejects without MMIO");
     os.mmio_read32 = read_reg;
+    card.family = RDN_FAMILY_CAYMAN; cayman_register = 1;
+    reset_flush(1, 0);
+    check(!rdn_gart_flush_checked(&gart) && reads == 1, "Cayman flush accepts completion");
+    reset_flush(0, 2);
+    response = 1;
+    check(!rdn_gart_flush_checked(&gart) && reads == 3 && delays == 2, "Cayman flush waits for completion");
+    reset_flush(1, 0); inaccessible = 1;
+    check(rdn_gart_flush_checked(&gart) == -EIO && reads == 1, "Cayman inaccessible register cannot confirm flush");
+    inaccessible = 0; cayman_register = 0; card.family = RDN_FAMILY_TURKS;
     reset_flush(2, 0); rdn_gart_flush(&gart);
     check(writes == 2 && reads == 1, "legacy void wrapper remains callable");
     printf("%s: %u CP DMA/GART checks\n", failures ? "FAIL" : "PASS", checks);

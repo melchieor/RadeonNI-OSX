@@ -1,0 +1,18 @@
+--- a/gcc/config/rs6000/rs6000.c
++++ b/gcc/config/rs6000/rs6000.c
+@@ -20714,8 +20714,13 @@
+ 	 "L42" should be a 'branch island', that will do a far jump to
+ 	 'foo'.  Branch islands are generated in
+ 	 macho_branch_islands().  */
+-      sprintf (buf, "jbsr %%z%d,%%l%d",
+-	       dest_operand_number, 1+dest_operand_number);
++      /* Modern ld64 rejects the external JBSR relaxation hint in a
++         relocatable kext. Keep the actual long-call island unconditionally. */
++      if (flag_mkernel || flag_apple_kext)
++        sprintf (buf, "bl %%l%d", 1+dest_operand_number);
++      else
++        sprintf (buf, "jbsr %%z%d,%%l%d",
++                 dest_operand_number, 1+dest_operand_number);
+       /* APPLE LOCAL end 4380289 */
+     }
+   else

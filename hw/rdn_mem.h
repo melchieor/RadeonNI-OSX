@@ -37,6 +37,7 @@ int rdn_mem_alloc_in_range(struct rdn_mem *mem, uint64_t size, uint64_t align,
 			  uint64_t minimum, uint64_t maximum, uint64_t *offset);
 /* Free the range that starts at `offset`; unknown offsets are ignored. */
 void rdn_mem_free(struct rdn_mem *mem, uint64_t offset);
+uint64_t rdn_mem_allocation_size(struct rdn_mem *mem, uint64_t offset);
 /* Bytes not handed out. */
 uint64_t rdn_mem_available(struct rdn_mem *mem);
 /* Bytes not handed out inside [lo, hi), and (if `largest` is not NULL) the largest free piece there. */
@@ -44,4 +45,14 @@ uint64_t rdn_mem_available_range(struct rdn_mem *mem, uint64_t lo, uint64_t hi,
 				 uint64_t *largest);
 uint64_t rdn_mem_largest(struct rdn_mem *mem);
 
+/* Read-only partition inventory; caller holds the allocator lock. A fingerprint
+ * is diagnostic evidence, not a complete persistence image or cryptographic proof. */
+struct rdn_mem_inventory { uint64_t used_bytes;uint32_t allocations,blocks,fingerprint; };
+int rdn_mem_inventory(struct rdn_mem *,struct rdn_mem_inventory *);
+/* Capture allocator metadata only. Caller must hold the heap lock throughout.
+ * On failure or insufficient capacity, the output array is unchanged.
+ * This does not preserve VRAM contents, mappings, or device state. */
+struct rdn_mem_range { uint64_t offset, size; };
+int rdn_mem_snapshot_ranges(struct rdn_mem *, struct rdn_mem_range *,
+                            uint32_t capacity, uint32_t *required);
 #endif /* RDN_MEM_H */

@@ -32,6 +32,9 @@ public:
 	virtual bool serializeProperties(OSSerialize *s) const;
 
 	/* The public methods, in the order of eIOAccelSurfaceMethods. */
+    IOReturn initializeGpu();
+    IOReturn gpuInfo(struct rdn_user_surface_info *info);
+    IOReturn gpuCopy(UInt32 offset, UInt32 stride, UInt32 width, UInt32 height);
 	IOReturn readLockOptions(UInt32 options, IOAccelSurfaceInformation *info,
 				 IOByteCount *size);
 	IOReturn readUnlockOptions(UInt32 options);
@@ -63,6 +66,7 @@ public:
 
 private:
 	RadeonNIAccel *fAccel;
+	RadeonNIAccel *fReadAccel;
 	UInt32 fWid, fMode;
 	/* Whose client this is, and its view of the surface while read-locked. */
 	task_t fTask;
@@ -75,6 +79,8 @@ private:
 	IOMemoryDescriptor *fBackingMemory;
 	IOMemoryMap *fBackingMap;
 	UInt32 fBackingAddress, fBackingStride, fBackingWidth, fBackingHeight;
+    UInt32 fBackingGart, fBackingPageOffset;
+    bool fBackingGpuBound, fBackingDmaFailed;
 	IOReturn configureBacking(UInt32 options, UInt32 fbIndex, UInt32 address,
 	                          UInt32 stride, UInt32 length,
 	                          IOAccelDeviceRegion *region, IOByteCount size);
