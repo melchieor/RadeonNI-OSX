@@ -195,3 +195,52 @@ uint64_t rdn_mem_largest(struct rdn_mem *mem)
 	rdn_mem_available_range(mem, 0, UINT64_MAX, &largest);
 	return largest;
 }
+
+uint64_t rdn_mem_allocation_size(struct rdn_mem *mem, uint64_t offset)
+{
+    struct rdn_mem_block *b;
+    for (b = mem->head; b; b = b->next)
+        if (b->start == offset && b->used) return b->size;
+    return 0;
+}
+
+int rdn_mem_inventory(struct rdn_mem *mem,struct rdn_mem_inventory *out)
+{
+ struct rdn_mem_block *b;uint64_t next,end;unsigned i;
+ if(!out)return -1;
+ memset(out,0,sizeof(*out));out->fingerprint=2166136261u;
+ if(!mem || !mem->head || mem->base>UINT64_MAX-mem->size)return -1;
+ next=mem->base;end=mem->base+mem->size;
+ for(b=mem->head;b;b=b->next) {
+  uint64_t values[3];
+  if(++out->blocks>16384 || b->start!=next || b->start>end || b->size>end-b->start ||
+     (!b->size && mem->size))return -1;
+  next=b->start+b->size;
+  if(b->used){out->used_bytes+=b->size;++out->allocations;}
+  values[0]=b->start;values[1]=b->size;values[2]=b->used?1:0;
+  for(i=0;i<3;i++) {
+   out->fingerprint=(out->fingerprint^(uint32_t)values[i])*16777619u;
+   out->fingerprint=(out->fingerprint^(uint32_t)(values[i]>>32))*16777619u;
+  }
+ }
+ return next==end?0:-1;
+}
+
+/* Two passes under the caller's lock: validate the complete partition before
+ * touching the caller's array, then copy only used ranges. */
+int rdn_mem_snapshot_ranges(struct rdn_mem *mem,struct rdn_mem_range *out,
+                            uint32_t capacity,uint32_t *required)
+{
+ struct rdn_mem_inventory inventory;
+ struct rdn_mem_block *b;
+ uint32_t index=0;
+ if(!required)return -1;
+ *required=0;
+ if(rdn_mem_inventory(mem,&inventory))return -1;
+ *required=inventory.allocations;
+ if(capacity<inventory.allocations || (inventory.allocations && !out))return -1;
+ for(b=mem->head;b;b=b->next)if(b->used) {
+  out[index].offset=b->start;out[index].size=b->size;++index;
+ }
+ return 0;
+}

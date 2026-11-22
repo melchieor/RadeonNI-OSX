@@ -3,6 +3,11 @@
 #include <string.h>
 #include "../hw/rdn_accel.h"
 #include "../hw/rdn_accel_reg.h"
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+#include "../hw/rdn_quiesce.h"
+#include "../hw/rdn_sleep_copy.h"
+#include "../hw/rdn_gart.h"
+#endif
 
 #define AP_WORDS 192u
 #define RING_OFFSET 64u
@@ -15,6 +20,20 @@ struct model {
     uint32_t offsets[4], values[4];
     unsigned writes, reads, delays;
 };
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+struct copy_fixture {struct model *model;struct rdn_quiesce *q;struct rdn_sleep_ib_ticket *ticket;int done,synced;};
+static int copy_submit(void *p,uint32_t *f)
+{
+ struct copy_fixture *c=p;
+ return rdn_ib_try_submit_sleep(&c->model->accel,c->q,c->ticket,4,f) ? -1 : 0;
+}
+static int copy_poll(void *p,uint32_t f)
+{struct copy_fixture *c=p;(void)f;return c->done;}
+static int copy_sync(void *p)
+{struct copy_fixture *c=p;return c->synced?0:-1;}
+static int stage_matches(void *p,struct rdn_stage *stage,struct rdn_gart *gart)
+{return p==stage && gart->ready;}
+#endif
 static void check(int good, const char *name)
 {
     checks++;
@@ -89,6 +108,7 @@ static void error_case(struct model *m, uint64_t addr, uint32_t words, int expec
 int main(void)
 {
     struct model m, legacy;
+    volatile uint32_t gate;
     uint32_t size, start, rptr, space, saved[AP_WORDS];
     struct rdn_accel before;
     int swapped, ret;
@@ -123,6 +143,65 @@ int main(void)
     }
 #define RESET_MODEL() init(&m, 128, 0, 0, 0)
 #define BAD(name) error_case(&m, 0x7a12345000ull, 121, -EINVAL, name)
+    RESET_MODEL(); gate=1; m.accel.submission_gate=&gate;
+    error_case(&m,0x1000,1,-EBUSY,"draining gate rejects without publication");
+    check(!m.reads,"draining gate rejects before MMIO read");
+    RESET_MODEL(); gate=2; m.accel.submission_gate=&gate;
+    error_case(&m,0x1000,1,-EBUSY,"held gate rejects without publication");
+    check(!m.reads,"held gate rejects before MMIO read");
+    RESET_MODEL(); gate=0; m.accel.submission_gate=&gate;
+    check(!rdn_ib_try_submit(&m.accel,0x1000,1,&m.seq),"running gate allows publication");
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+    {
+        struct rdn_quiesce q={RDN_QUIESCE_HELD_POWERED,5,0,0,50,0,1};
+        struct rdn_sleep_ib_ticket ticket={5,640,64,0};
+        RESET_MODEL();m.accel.submission_gate=&q.phase;
+        before=m.accel;memcpy(saved,m.mem,sizeof(saved));
+        q.phase=RDN_QUIESCE_DRAINING;
+        check(rdn_ib_try_submit_sleep(&m.accel,&q,&ticket,4,&m.seq)==-EINVAL && unchanged(&m,&before,saved) && !ticket.used && !m.reads,"internal submit requires held phase");
+        q.phase=RDN_QUIESCE_HELD_POWERED;ticket.generation=4;
+        check(rdn_ib_try_submit_sleep(&m.accel,&q,&ticket,4,&m.seq)==-EINVAL && !m.reads,"stale internal generation rejected");
+        ticket.generation=5;ticket.offset=64;
+        check(rdn_ib_try_submit_sleep(&m.accel,&q,&ticket,4,&m.seq)==-EINVAL && !m.reads,"IB overlapping ring rejected");
+        ticket.offset=0;
+        check(rdn_ib_try_submit_sleep(&m.accel,&q,&ticket,4,&m.seq)==-EINVAL && !m.reads,"IB overlapping fence rejected");
+        ticket.offset=640;
+        check(rdn_ib_try_submit_sleep(&m.accel,&q,&ticket,17,&m.seq)==-EINVAL && !m.reads,"IB length exceeding ticket rejected");
+        m.rptr=16;
+        check(rdn_ib_try_submit_sleep(&m.accel,&q,&ticket,4,&m.seq)==-EBUSY && !ticket.used && !m.writes,"nonempty ring rejects internal submission");
+        m.rptr=0;
+        check(!rdn_ib_try_submit_sleep(&m.accel,&q,&ticket,4,&m.seq) && ticket.used && m.seq==0x12345678,"held empty ring accepts one owned IB");
+        check(rdn_ib_try_submit_sleep(&m.accel,&q,&ticket,4,&m.seq)==-EINVAL,"ticket cannot be replayed");
+        {
+            struct rdn_sleep_copy copy={0};
+            const struct rdn_sleep_copy_ops ops={copy_submit,copy_poll,copy_sync};
+            struct copy_fixture fixture={&m,&q,&ticket,0,0};
+            RESET_MODEL();m.accel.submission_gate=&q.phase;ticket.used=0;q.internal_hold=0;
+            check(!rdn_sleep_copy_start(&copy,&q,1,&ops,&fixture) && ticket.used,"coordinator submits the guarded production IB prototype");
+            check(!rdn_sleep_copy_poll(&copy,&ops,&fixture) && rdn_sleep_copy_release(&copy),"pending fence keeps copy retained");
+            fixture.done=1;fixture.synced=1;
+            check(rdn_sleep_copy_poll(&copy,&ops,&fixture)==1 && !rdn_sleep_copy_release(&copy),"observed fence and CPU sync permit release");
+        }
+    }
+    {
+        struct rdn_quiesce q={RDN_QUIESCE_HELD_POWERED,9,0,0,50,0,1};
+        struct rdn_sleep_gart_ib_ticket ticket={9,0};
+        struct rdn_stage stage={RDN_STAGE_BOUND,4096,4096,1};
+        struct rdn_gart gart={0};
+        RESET_MODEL();m.accel.submission_gate=&q.phase;m.accel.vram_size=0x80000000ull;
+        gart.ready=true;gart.accel=&m.accel;
+        check(rdn_ib_try_submit_sleep_gart(&m.accel,&q,&ticket,&stage,&gart,stage_matches,0,13,&m.seq)==-EINVAL && !m.reads && !ticket.used,"unmatched GART command stage rejected");
+        q.internal_hold=0;
+        check(rdn_ib_try_submit_sleep_gart(&m.accel,&q,&ticket,&stage,&gart,stage_matches,&stage,13,&m.seq)==-EINVAL && !m.reads,"GART submit requires internal hold");
+        q.internal_hold=1;ticket.generation=8;
+        check(rdn_ib_try_submit_sleep_gart(&m.accel,&q,&ticket,&stage,&gart,stage_matches,&stage,13,&m.seq)==-EINVAL && !m.reads,"stale GART generation rejected");
+        ticket.generation=9;m.rptr=16;
+        check(rdn_ib_try_submit_sleep_gart(&m.accel,&q,&ticket,&stage,&gart,stage_matches,&stage,13,&m.seq)==-EBUSY && !m.writes && !ticket.used,"GART submit requires empty ring");
+        m.rptr=0;
+        check(!rdn_ib_try_submit_sleep_gart(&m.accel,&q,&ticket,&stage,&gart,stage_matches,&stage,13,&m.seq) && ticket.used && m.seq==0x12345678,"private GART IB admitted once while held");
+        check(rdn_ib_try_submit_sleep_gart(&m.accel,&q,&ticket,&stage,&gart,stage_matches,&stage,13,&m.seq)==-EINVAL,"GART ticket replay rejected");
+    }
+#endif
     RESET_MODEL(); m.rptr = 128; BAD("RPTR at ring size rejects without masking");
     RESET_MODEL(); m.rptr = 0xffffffff; BAD("invalid all-ones RPTR rejects without writes");
     RESET_MODEL(); m.accel.wptr = 1; BAD("uncommitted WPTR rejects");

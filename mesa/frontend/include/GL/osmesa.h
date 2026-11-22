@@ -106,6 +106,7 @@ extern "C" {
 #define OSMESA_COMPAT_PROFILE        0x35
 #define OSMESA_CONTEXT_MAJOR_VERSION 0x36
 #define OSMESA_CONTEXT_MINOR_VERSION 0x37
+#define OSMESA_LOSE_CONTEXT_ON_RESET 0x38 /* RadeonNI: boolean reset notification */
 
 
 typedef struct osmesa_context *OSMesaContext;
@@ -411,7 +412,7 @@ OSMesaMakeCurrentStore( OSMesaContext ctx, GLuint handle, GLsizei stride,
                         GLuint offset, GLsizei width, GLsizei height,
                         GLuint flags );
 
-/* Publish completed store rendering to a caller-owned CPU backing. */
+/* Publish store rendering to a CPU backing; NULL/0 keeps rendering GPU-only. */
 GLAPI GLboolean GLAPIENTRY
 OSMesaStoreBacking( OSMesaContext ctx, void *backing, GLsizei stride );
 
@@ -455,6 +456,33 @@ OSMesaTexStoreImage( OSMesaContext ctx, GLenum target, GLuint handle,
 GLAPI GLboolean APIENTRY
 OSMesaTexCopyDrawable( OSMesaContext ctx, GLenum target, GLint x, GLint y,
                        GLsizei width, GLsizei height );
+
+/* The caller must unmap after the synchronous consumer finishes reading. */
+GLAPI void * APIENTRY
+OSMesaMapStoreImage(OSMesaContext ctx, GLuint handle, GLsizei stride,
+                    GLuint offset, GLsizei width, GLsizei height,
+                    const void **pixels, GLuint *row_bytes);
+GLAPI void APIENTRY OSMesaUnmapStoreImage(void *lease);
+
+/* Copy a read-locked foreign GPU surface into the current GPU's texture. */
+GLAPI GLboolean GLAPIENTRY
+OSMesaReadStoreImage(OSMesaContext osmesa, GLuint handle, GLsizei stride,
+                     GLuint offset, GLsizei width, GLsizei height, void *pixels);
+
+GLAPI GLint APIENTRY
+OSMesaClearStoreImage(OSMesaContext ctx, GLuint handle, GLsizei stride,
+                       GLuint offset, GLsizei width, GLsizei height);
+
+/* When accepted is set, the texture owns the lease until GPU use completes. */
+GLAPI GLint APIENTRY
+OSMesaTexHostImage(OSMesaContext ctx, GLenum target, GLsizei width,
+                   GLsizei height, GLsizei stride, const void *pixels,
+                   GLboolean alpha, void *lease, void (*release)(void *), GLint *accepted);
+
+GLAPI GLboolean APIENTRY
+OSMesaTexMemoryImage(OSMesaContext ctx, GLenum target, GLsizei width,
+                     GLsizei height, GLsizei stride, const void *pixels,
+                     GLboolean alpha);
 
 
 /*
@@ -562,6 +590,9 @@ typedef void (*OSMESAproc)();
  */
 GLAPI OSMESAproc APIENTRY
 OSMesaGetProcAddress( const char *funcName );
+
+GLAPI GLboolean APIENTRY
+OSMesaMigrateLegacyState(OSMesaContext destination, OSMesaContext source);
 
 
 

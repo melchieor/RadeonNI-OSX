@@ -43,6 +43,10 @@ static bool dtd_mode(const uint8_t *d, struct rdn_mode *mode)
 	vso = (uint16_t)((d[10] >> 4) | (((d[11] >> 2) & 3) << 4));
 	vsw = (uint16_t)((d[10] & 0xf) | ((d[11] & 3) << 4));
 
+	if (!hact || !vact || !hblank || !vblank || !hsw || !vsw ||
+	    hso + hsw > hblank || vso + vsw > vblank)
+		return false;
+
 	memset(mode, 0, sizeof(*mode));
 	mode->clock = clock;
 	mode->hdisplay = hact;
@@ -197,15 +201,41 @@ static bool in_ranges(const uint8_t *edid, const struct rdn_mode *m)
 	       (!clock || m->clock <= clock);
 }
 
-/* Progressive CEA-861 video codes the DMT table lacks. */
+/* Progressive CEA-861 video codes whose timings differ from or lack DMT. */
 static const struct { uint8_t vic; struct rdn_mode m; } cea_modes[] = {
 	{ 2,  { 27000, 720, 736, 798, 858, 480, 489, 495, 525, RDN_MODE_NHSYNC | RDN_MODE_NVSYNC } },
 	{ 3,  { 27000, 720, 736, 798, 858, 480, 489, 495, 525, RDN_MODE_NHSYNC | RDN_MODE_NVSYNC } },
+	/* CEA VIC 16 has positive syncs; DMT 1920x1080 has negative syncs. */
+	{ 16, { 148500, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125, 0 } },
 	{ 17, { 27000, 720, 732, 796, 864, 576, 581, 586, 625, RDN_MODE_NHSYNC | RDN_MODE_NVSYNC } },
 	{ 18, { 27000, 720, 732, 796, 864, 576, 581, 586, 625, RDN_MODE_NHSYNC | RDN_MODE_NVSYNC } },
 	{ 19, { 74250, 1280, 1720, 1760, 1980, 720, 725, 730, 750, 0 } },
 	{ 31, { 148500, 1920, 2448, 2492, 2640, 1080, 1084, 1089, 1125, 0 } },
 };
+
+int rdn_edid_add_apple_cinema_1080p(const uint8_t *edid, int len,
+				   struct rdn_mode *out, int n, int max)
+{
+	static const uint8_t header[8] = {0x00,0xff,0xff,0xff,0xff,0xff,0xff,0x00};
+	static const struct rdn_mode mode = {148500,1920,2008,2052,2200,1080,1084,1089,1125,0};
+	struct rdn_mode preferred;
+	unsigned i, sum = 0;
+
+	if (!edid || !out || len < EDID_BLOCK || n < 0 || max < 0 || n > max)
+		return n;
+	for (i = 0; i < sizeof(header); ++i)
+		if (edid[i] != header[i]) return n;
+	for (i = 0; i < EDID_BLOCK; ++i) sum += edid[i];
+	if ((sum & 0xff) || edid[8] != 0x06 || edid[9] != 0x10 ||
+	    edid[10] != 0x26 || edid[11] != 0x92)
+		return n;
+	if (!rdn_edid_preferred_mode(edid, &preferred) ||
+	    preferred.hdisplay != 2560 || preferred.vdisplay != 1440 ||
+	    !in_ranges(edid, &mode))
+		return n;
+	add_mode(out, &n, max, &mode);
+	return n;
+}
 
 /*
  * Quartz gives a program that asks for a size without a rate the last mode
@@ -340,8 +370,6 @@ int rdn_edid_modes(const uint8_t *edid, int len, struct rdn_mode *out, int max,
 					d = dmt_find(640, 480, 60);
 				else if (vic == 4)
 					d = dmt_find(1280, 720, 60);
-				else if (vic == 16)
-					d = dmt_find(1920, 1080, 60);
 				else
 					d = NULL;
 				if (d)

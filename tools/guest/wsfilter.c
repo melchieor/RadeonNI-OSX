@@ -10,12 +10,12 @@
  *
  * A window of 600x400 at 300,300 is shown for that long, with four opaque
  * bands (red, green, blue, white, top to bottom, 100 rows each; WSF_PLAIN=1
- * leaves it empty and transparent); grab the screen meanwhile
- * (scripts/mac.sh g5 grab). The window server applies the filter to the
- * window's own picture, so with CIColorInvert the bands are cyan, magenta,
- * yellow and black if the window server's filters work. (Dashboard's ripple
- * is put on the Dock's layer in the same way.) The calls are private to
- * CoreGraphics; their arguments are as the Dock passes them.
+ * leaves it empty and transparent). The filter affects the content BEHIND
+ * this window; its own opaque bands are composited over the filtered result.
+ * Thus unchanged bands do NOT demonstrate filter failure. To inspect actual
+ * filtering, run WSF_PLAIN=1 with a Finder window/desktop behind the rectangle.
+ * CIColorInvert should invert that backdrop until this temporary window closes.
+ * These private CoreGraphics calls use the arguments observed from the Dock.
  *
  * Build on the host:
  *   scripts/darwin.sh powerpc-apple-darwin8-gcc -O2 -o build/wsfilter \
@@ -53,6 +53,10 @@ int main(int argc, char **argv)
 		printf("no window\n");
 		return 1;
 	}
+	printf("Filter affects the BACKDROP, not this window's own foreground.\n");
+    printf("Mode: %s\n",getenv("WSF_PLAIN") ?
+           "transparent: watch the desktop/Finder behind rectangle 300,300 to 900,700" :
+           "opaque foreground bands hide the result; use WSF_PLAIN=1 for visual validation");
 	ShowWindow(window);
 	if (!getenv("WSF_PLAIN")) {
 		static const float bands[4][3] = {
@@ -81,6 +85,7 @@ int main(int argc, char **argv)
 		err = CGSAddWindowFilter(cid, wid, filter, flags);
 		printf("CGSAddWindowFilter(window %d, flags 0x%x): error %d\n", wid, flags, err);
 	}
+	CFRelease(filter_name);
 	RunCurrentEventLoop(seconds);
 	if (filter) {
 		CGSRemoveWindowFilter(cid, wid, filter);
@@ -88,5 +93,5 @@ int main(int argc, char **argv)
 	}
 	DisposeWindow(window);
 	printf("done\n");
-	return 0;
+	return err ? 1 : 0;
 }

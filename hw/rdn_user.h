@@ -19,7 +19,41 @@
 #define RDN_UC_SERVICE_CLASS		"RadeonNIAccel"
 #define RDN_UC_TYPE			0x72646e31	/* upstream 'rdn1' */
 #define RDN_UC_TYPE_V2			0x72646e32	/* unified 'rdn2' */
+/* RadeonNI framebuffer: fixed read-only sensor and clock queries. */
+#define RDN_UC_TELEMETRY 0x72646e74
+#define RDN_TELEMETRY_SAMPLE 0
+#define RDN_TELEMETRY_CLOCKS 1
+#define RDN_TELEMETRY_BOARD 2
+#define RDN_SENSOR_VALID 0
+#define RDN_SENSOR_NOT_IMPLEMENTED 1
+#define RDN_SENSOR_NOT_PRESENT 2
+#define RDN_SENSOR_INVALID 3
+#define RDN_SENSOR_NO_DESCRIPTION 4
+
+struct rdn_user_board_sensors {
+ uint32_t version, size;
+ uint32_t fan_status, fan_rpm, tach_period, tach_clock_hz;
+ uint32_t fan_pulses, tach_edges, fan_min_rpm, fan_max_rpm;
+ uint32_t rail_status, rail_microvolts, voltage_control_id;
+ uint32_t thermal_controller;
+};
+
+
 #define RDN_UC_MEMORY_APERTURE		0
+/* Experimental private system-RAM mapping, never the framebuffer. */
+#define RDN_UC_MEMORY_GATE_PROBE 0x52444754u
+#define RDN_UC_MEMORY_UNIQUE_PROBE 0x5244554eu
+#define RDN_UC_MEMORY_PHYSICAL_PROBE 0x52445048u
+
+/* Byte counts use explicit word pairs for the PPC32/PPC64 ABI. */
+struct rdn_user_bytes { uint32_t hi, lo; };
+struct rdn_user_memory_usage {
+ uint32_t version, size;
+ struct rdn_user_bytes total, reserved, allocated, free;
+ struct rdn_user_bytes visible_capacity, visible_free, visible_largest;
+ struct rdn_user_bytes hidden_capacity, hidden_free, hidden_largest;
+ struct rdn_user_bytes command_capacity, command_free;
+};
 
 enum {
 	/* struct out: struct rdn_user_info */
@@ -205,6 +239,35 @@ enum {
 	RDN_UC_UVD_FIXTURE_RUN,
 	/* Admin-only immutable CPU snapshot: generation, chunk index ->4096 bytes. */
 	RDN_UC_UVD_FIXTURE_READ,
+	/* Metadata only; owner or administrator (WindowServer). */
+	RDN_UC_SURFACE_GPU_INFO,
+	/* Scalars: ID, owned destination offset/stride, width, height. */
+	RDN_UC_SURFACE_GPU_COPY,
+	/* Mode 0 queries; admin modes 1/2 enable/disable fence IRQs. */
+	/* Output flags: bit 0 IRQ active, bit 1 queued present, bit 2 graphics fault. */
+	RDN_UC_FENCE_CONTROL,
+	/* scalar in: surface ID; struct out: rdn_user_screen */
+	RDN_UC_SURFACE_SCREEN,
+	RDN_UC_MANAGED_INFO,
+	RDN_UC_MANAGED_ALIAS,
+	RDN_UC_MANAGED_EVICT,
+	RDN_UC_MANAGED_PROMOTE,
+	RDN_UC_COMMAND_INFO,
+	RDN_UC_ALLOC_COMMAND,
+	RDN_UC_MEMORY_USAGE,
+	/* v2 only: action, timeout_ms -> fixed power-retained rehearsal report. */
+	RDN_UC_SLEEP_REHEARSAL,
+	RDN_UC_SLEEP_MAINTENANCE,
+	RDN_UC_SLEEP_RESOURCE,
+	/* Experimental diagnostic: owned hidden page, 16-byte read, no sleep. */
+	RDN_UC_SLEEP_INDEX_HIDDEN,
+	/* Experimental: owned hidden page offset followed by four packed words. */
+	RDN_UC_SLEEP_INDEX_RESTORE,
+	/* Admin-only diagnostic: metadata summary of live VRAM range plan. */
+	RDN_UC_SLEEP_LIVE_PLAN,
+	RDN_UC_SLEEP_MAPPING_PROBE,
+	RDN_UC_SLEEP_MAPPING_UNIQUE_PROBE,
+	RDN_UC_SLEEP_MAPPING_PHYSICAL_PROBE,
 	RDN_UC_METHOD_COUNT
 };
 
@@ -258,7 +321,13 @@ struct rdn_user_uvd_diagnostic {
 
 #define RDN_UC_POWER_QUERY		0
 #define RDN_UC_POWER_PERFORMANCE	1	/* the PowerPlay table's fastest */
-#define RDN_UC_POWER_BOOT		2	/* what ASIC_Init leaves */
+#define RDN_UC_POWER_BOOT		2	/* boot clocks, or the SMC low-core cap */
+#define RDN_UC_POWER_THERMAL_LIMIT	3	/* what: 80..100 degrees C; SMC only */
+#define RDN_UC_POWER_START_SMC		4	/* explicit hardware bring-up; Cayman only */
+#define RDN_UC_POWER_TUNE		5	/* what: core MHz << 16 | memory MHz; 30-second lease */
+#define RDN_UC_POWER_UNDERVOLT 7 /* exact BIOS mV, at most -100 mV, never below idle VID; 30-second lease; 0 restores stock */
+#define RDN_UC_POWER_PROFILE 6 /* what: 0 = automatic, 1 = high; preserves the thermal limit */
+#define RDN_UC_REG_PCI_CONFIG		0x80000000u
 #define RDN_UC_TEMPERATURE_BIAS		1000000
 
 /* RDN_UC_UVD_INIT's flags (the same bits as RDN_UVD_F_* in hw/rdn_uvd.h): the decoder in a segment, back in the aperture. */
@@ -272,6 +341,10 @@ struct rdn_user_backing {
 
 struct rdn_user_surface_info {
 	uint32_t id, offset, row_bytes, width, height;
+};
+
+struct rdn_user_screen {
+	uint32_t index, offset, width, height, pitch_pixels, bits_per_pixel, scanout;
 };
 
 struct rdn_user_info {
@@ -318,6 +391,44 @@ struct rdn_user_surfaces {
 	} surface[RDN_USER_SURFACES];
 };
 
+#define RDN_SLEEP_REHEARSAL_VERSION 1u
+#define RDN_SLEEP_STATUS 0u
+#define RDN_SLEEP_REHEARSE 1u
+struct rdn_user_sleep_rehearsal {
+ uint32_t version,size,enabled,state,result,generation,elapsed_ms,timeout_ms;
+ uint32_t held_witness,fence_before,fence_after,wptr_before,wptr_after;
+ uint32_t rptr_before,rptr_after,busy_mask,sleep_supported,power_retained;
+ uint32_t full_mmio_gated,resources_recreated,fan_full_requested,queue_state_unchanged,gate_verified;
+};
+
+/* Appended v2 method; the 92-byte stage-1 ABI stays unchanged. */
+#define RDN_SLEEP_MAINTENANCE_VERSION 1u
+struct rdn_user_sleep_maintenance {
+ struct rdn_user_sleep_rehearsal base;
+ uint32_t version,size,cursor_excluded,cursor_resumed,fan_excluded;
+ uint32_t hotplug_excluded,telemetry_excluded,hold_ms,cursor_deferred;
+};
+#define RDN_SLEEP_RESOURCE_VERSION 1u
+#define RDN_SLEEP_LIVE_PLAN_VERSION 1u
+#define RDN_LIVE_MISSING_CONTENTS 1u
+#define RDN_LIVE_MISSING_GART 2u
+#define RDN_LIVE_MISSING_DEVICE_STATE 4u
+#define RDN_LIVE_MISSING_CLIENT_METADATA 8u
+struct rdn_user_live_plan {
+ uint32_t version,size,range_count,visible_allocations,command_allocations,hidden_allocations;
+ uint32_t reserved_lo,reserved_hi,visible_lo,visible_hi,command_lo,command_hi;
+ uint32_t hidden_lo,hidden_hi,image_lo,image_hi,missing_mask,content_saved;
+};
+/* Diagnostic selector flag; the indexed write always uses a fixed pattern. */
+#define RDN_SLEEP_INDEX_WRITE 0x80000000u
+struct rdn_user_sleep_resource {
+ struct rdn_user_sleep_maintenance maintenance;
+ uint32_t version,size,owned_offset,owned_bytes,saved_words,restored_words;
+ uint32_t restore_mismatches,poison_mismatches,metadata_unchanged;
+ uint32_t visible_allocations,command_allocations,hidden_allocations,gart_bindings;
+ uint32_t visible_used,command_used,hidden_used,reserved_bytes,topology_before,topology_after;
+ uint32_t coverage_complete,device_restored,allocation_valid,private_connection,inventory_valid;
+};
 #define RDN_USER_VERSION		1
 
 #endif /* RDN_USER_H */

@@ -21,7 +21,14 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 bin=${1:?usage: $0 <kext binary>}
 
-"$root/scripts/darwin.sh" powerpc-apple-darwin8-otool -rv "$bin" 2>/dev/null |
+relocations() {
+    if [ -n "${RDN_OTOOL:-}" ]; then
+        "$RDN_OTOOL" -rv "$bin"
+    else
+        "$root/scripts/darwin.sh" powerpc-apple-darwin8-otool -rv "$bin"
+    fi
+}
+relocations |
 awk '
     /^Relocation information/ { sec = $0; next }
     sec == "" || sec ~ /__TEXT,__text/ { next }

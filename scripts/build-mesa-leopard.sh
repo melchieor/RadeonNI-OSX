@@ -78,11 +78,16 @@ docker run --rm --network none \
           -Dplatforms= -Dgles1=disabled -Dgles2=disabled -Dzstd=disabled \
           -Dvalgrind=disabled -Dlibunwind=disabled -Dvideo-codecs= \
           -Dgallium-va=disabled -Dbuildtype=release -Doptimization=2 \
-          -Dxmlconfig=disabled -Dshader-cache=disabled -Db_ndebug=true \
+          -Dxmlconfig=disabled -Dshader-cache=enabled -Dshader-cache-max-size=64M -Db_ndebug=true \
           --cross-file "$RDN_ROOT/third_party/mesa-darwin9-cross.ini" \
           --wrap-mode=nodownload
       fi
       python3 "$RDN_ROOT/scripts/meson-darwin9-args.py" \
         "$RDN_ROOT/third_party/mesa-darwin9-cross.ini" build-darwin9
-      ninja -C build-darwin9 src/gallium/targets/rdn/RadeonNIGLDriver.dylib
+      python3 -m mesonbuild.mesonmain configure build-darwin9 -Dshader-cache=enabled -Dshader-cache-max-size=64M
+      ninja -C build-darwin9 \
+        src/gallium/targets/rdn/RadeonNIGLDriver.dylib \
+        src/gallium/targets/rdn/RadeonNIGLDriver1.dylib \
+        src/gallium/targets/rdn/RadeonNIGLDriver2.dylib \
+        src/gallium/targets/rdn/RadeonNIGLDriver3.dylib
     '

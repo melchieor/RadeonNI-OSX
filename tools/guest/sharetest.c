@@ -83,7 +83,7 @@ int main(int argc, char **argv)
 	static unsigned char picture[4 * 4 * 4];
 	unsigned char px[4];
 	GLuint tex = 0, prog = 0, tex2 = 0;
-	long npix = 0;
+	GLint npix = 0;
 	int n = 0, i;
 
 	attrs[n++] = kCGLPFAOffScreen;

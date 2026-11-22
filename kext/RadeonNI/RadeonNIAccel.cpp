@@ -8,17 +8,33 @@
 
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
+#ifdef RDN_SLEEP_INDEX_PROBE
+#include <kern/task.h>
+#endif
 #include <libkern/libkern.h>
 #include <stdarg.h>
 #include <IOKit/graphics/IOGraphicsInterfaceTypes.h>
 #include <sys/errno.h>
+#ifdef RDN_LEOPARD
+#include <sys/proc.h>
+#include <sys/kauth.h>
+#endif
 
+#include "rdn_snapshot.h"
 #include "RadeonNI.h"
 #include "RadeonNIAccel.h"
 #include "RadeonNIVideo.h"
 #include "RadeonNISurface.h"
 #include "rdn_uvd_reg.h"
 #include "rdn_mc.h"
+#ifdef RDN_SLEEP_INDEX_PROBE
+extern "C" {
+#include "rdn_live_plan.h"
+}
+#endif
+extern "C" {
+#include "rdn_cp_dma_readback.h"
+}
 
 /* sync: orders every earlier store, also to write-combined memory, before the next one (eieio orders only guarded I/O) */
 static inline void rdnStoreBarrier(void)
@@ -76,6 +92,7 @@ OSDefineMetaClassAndStructors(RadeonNIAccel, IOAccelerator)
 #define SCREEN_OFFSET		(BLIT_OFFSET + (64u << 10))
 #define SCREEN_SLOT_BYTES	(128u << 10)
 #define HEAP_OFFSET		(34u << 20)
+#define COMMAND_BYTES (8u << 20)
 
 RadeonNIAccel *RadeonNIAccel::withFramebuffer(RadeonNI *fb, IOService *provider)
 {
@@ -93,6 +110,9 @@ RadeonNIAccel *RadeonNIAccel::withFramebuffer(RadeonNI *fb, IOService *provider)
 		accel->release();
 		return 0;
 	}
+#ifdef RDN_SLEEP_INDEX_PROBE
+    accel->fMappingProbeReserved=false;accel->fMappingProbePoisoned=false;
+#endif
 	OSNumber *shim = OSDynamicCast(OSNumber, fb->getProperty("AGPShim"));
 	UInt32 which = shim ? shim->unsigned32BitValue() : 0;
 
@@ -153,26 +173,57 @@ RadeonNIAccel *RadeonNIAccel::withFramebuffer(RadeonNI *fb, IOService *provider)
 	}
 	accel->fFramebuffer = fb;
 	accel->fUvdProvider = provider;
+	accel->fRetiredVram = 0;
+	accel->fFenceLoop = 0; accel->fFenceSource = 0;
+	accel->fFenceIRQEnabled = false;
+	accel->fFenceRingOffset = accel->fFenceRptr = 0;
+	accel->fFenceEvents = accel->fFenceFallbacks = 0;
+	accel->fFenceControlLock = IOLockAlloc();
 	accel->fLock = IOLockAlloc();
 	accel->fUvdLock = IOLockAlloc();
 	accel->fVideoSession = 0;
+	bzero(accel->fVideoSessions, sizeof(accel->fVideoSessions));
+	accel->fVideoSessionCount = 0;
 	accel->fVideoEpoch = 0;
 	accel->fVideoCpuBytes = 0;
 	accel->fVideoBusy = false;
-	if (!accel->fLock || !accel->fUvdLock) {
+	accel->fVideoStagingOffset = accel->fVideoStagingBytes = 0;
+	if (!accel->fLock || !accel->fUvdLock || !accel->fFenceControlLock) {
 		accel->detach(parent);
 		accel->release();
 		return 0;
 	}
+    rdn_quiesce_init(&accel->fQuiesce);
+    bzero(&accel->fSleepReport,sizeof(accel->fSleepReport));
+    accel->fSleepReport.result=RDN_QUIESCE_NEVER;
+    bzero(&accel->fMaintenanceReport,sizeof(accel->fMaintenanceReport));
+    accel->fMaintenanceReport.base.result=RDN_QUIESCE_NEVER;
+    bzero(&accel->fResourceReport,sizeof(accel->fResourceReport));
+    accel->fResourceReport.maintenance.base.result=RDN_QUIESCE_NEVER;
 	accel->fRetiring = false;
 	accel->fUvdColdAttempted = false;
 	bzero(&accel->fUvdFixture, sizeof(accel->fUvdFixture));
 	accel->fUvdFixtureOffset = accel->fUvdFixtureBytes = 0;
 	accel->fUvdFixtureSnapshot = 0;
 	accel->fEngineUp = false;
+	accel->fHardwarePower = 0;
+	accel->fThermalFallback = accel->fManualPowerCap = accel->fPerformanceMode = false;
+	accel->fPowerPolls = 0;accel->fDisplayPowerHeld=false;accel->fLastVideoPowerWork=0;
+ accel->fClockTuning=false;accel->fTuneDeadline=0;
+	accel->fPowerLoop = 0;
+	accel->fPowerTimer = 0;
+	accel->fIdleGovernor = accel->fPowerIdle = accel->fPowerFault = false;
 	accel->setName("RadeonNIAccel");
 	accel->setProperty("IOMatchCategory", "IOAccelerator");
-	accel->setProperty("IOGLBundleName", GL_BUNDLE_NAME);
+	OSNumber *gldIndex = OSDynamicCast(OSNumber, fb->getProperty("GLDDeviceIndex"));
+	UInt32 rendererIndex = gldIndex ? gldIndex->unsigned32BitValue() : 0;
+	char bundleName[64];
+	if (rendererIndex)
+		snprintf(bundleName, sizeof(bundleName), "%s%u", GL_BUNDLE_NAME, (unsigned)rendererIndex);
+	else
+		snprintf(bundleName, sizeof(bundleName), "%s", GL_BUNDLE_NAME);
+	accel->setProperty("GLDDeviceIndex", (UInt64)rendererIndex, 32);
+	accel->setProperty("IOGLBundleName", bundleName);
 	accel->setProperty(kIOAccelRevisionKey,
 			   (UInt64)kCurrentGraphicsInterfaceRevision, 32);
 
@@ -196,6 +247,10 @@ RadeonNIAccel *RadeonNIAccel::withFramebuffer(RadeonNI *fb, IOService *provider)
 		IOReturn result = accel->uvdDiagnosticInit(&status);
 		IOLog("RadeonNI: video startup result 0x%x status 0x%lx\n", result, (unsigned long)status);
 	}
+    if(accel->fEngineUp)accel->fAccel.submission_gate=&accel->fQuiesce.phase;
+    accel->setProperty("SleepRehearsalVersion",(UInt64)RDN_SLEEP_REHEARSAL_VERSION,32);
+    accel->setProperty("SleepMaintenanceVersion",(UInt64)RDN_SLEEP_MAINTENANCE_VERSION,32);
+    accel->setProperty("SleepResourceVersion",(UInt64)RDN_SLEEP_RESOURCE_VERSION,32);
 	accel->setProperty("RadeonNIEngine", accel->fEngineUp);
 	accel->setProperty("RadeonNIUVDDiagnosticVersion",
 		(UInt64)RDN_UVD_DIAGNOSTIC_VERSION, 32);
@@ -228,6 +283,15 @@ RadeonNIAccel *RadeonNIAccel::withFramebuffer(RadeonNI *fb, IOService *provider)
 				(UInt64)kCurrentGraphicsInterfaceRevision, 32);
 		IOLog("RadeonNI: accelerator at %s\n", path);
 	}
+	accel->startIdleGovernor();
+	/* Keep IRQ waits opt-in until sustained mixed-client testing passes. */
+	int irq = 0;
+	PE_parse_boot_arg("rdn_irq", &irq);
+	if (irq) {
+		UInt32 active, events, fallbacks;
+		IOReturn result = accel->fenceControl(1, &active, &events, &fallbacks);
+		IOLog("RadeonNI: fence interrupts 0x%x\n", (unsigned)result);
+	}
 	accel->registerService();
 	return accel;
 }
@@ -249,6 +313,9 @@ void *RadeonNIAccel::copyFirmware(const char *key, UInt32 *size)
 
 bool RadeonNIAccel::startEngine(void)
 {
+    bzero(fSurfaceMirrors, sizeof(fSurfaceMirrors));
+    fSurfaceGpuCopies = fSurfaceGpuBytes = 0;
+    fSurfaceGpuStalled = false;
 	typedef char ScratchAfterScreenSlots[
 		SCREEN_OFFSET + kScreenSlots * SCREEN_SLOT_BYTES <=
 		RDN_MC_LAYOUT_SCRATCH_OFFSET ? 1 : -1];
@@ -264,27 +331,42 @@ bool RadeonNIAccel::startEngine(void)
 		IOLog("RadeonNI: no microcode in the personality; no 3D engine\n");
 		return false;
 	}
+	fPfpSize = pfpSize;
+	fMeSize = meSize;
+	fHangSince = 0;
+	fHangMs = 5000;
+	{
+		int hangMs;
+		if (PE_parse_boot_arg("rdn_hang_ms", &hangMs) && hangMs >= 0)
+			fHangMs = (UInt32)hangMs;
+	}
 	fw.pfp = (const uint8_t *)fPfp;
 	fw.pfp_size = pfpSize;
 	fw.me = (const uint8_t *)fMe;
 	fw.me_size = meSize;
 
-	if (!fFramebuffer->aperture() || apertureSize <= HEAP_OFFSET)
+	if (!fFramebuffer->aperture() || apertureSize <= HEAP_OFFSET + COMMAND_BYTES)
 		return false;
-	if (rdn_mem_init(&fMem, fFramebuffer->os(), HEAP_OFFSET,
-			 apertureSize - HEAP_OFFSET))
+	if (rdn_mem_init(&fMem, fFramebuffer->os(), HEAP_OFFSET + COMMAND_BYTES,
+			 apertureSize - HEAP_OFFSET - COMMAND_BYTES))
 		return false;
+	if (rdn_mem_init(&fCommandMem, fFramebuffer->os(), HEAP_OFFSET, COMMAND_BYTES)) {
+		rdn_mem_fini(&fMem); return false;
+	}
 	const bool coldUvd =
 		fFramebuffer->getProperty("EnableUVDDiagnostics") == kOSBooleanTrue &&
 		fFramebuffer->getProperty("UVDDiagnosticsBeforeCP") == kOSBooleanTrue;
+	int irq = 0;
+	PE_parse_boot_arg("rdn_irq", &irq);
 	r = rdn_accel_init_hook(&fAccel, fFramebuffer->card(), fFramebuffer->aperture(),
 			   apertureSize, &fw, RING_OFFSET, RING_BYTES,
-			   RDN_BIG_ENDIAN, coldUvd ? prepareUvdBeforeCP : 0, this);
+			   RDN_BIG_ENDIAN, (coldUvd || irq) ? prepareBeforeCP : 0, this);
 	if (r) {
 		IOLog("RadeonNI: the 3D engine did not start (%d)\n", r);
 		if (fUvd.prepared)
 			rdn_uvd_fini(&fUvd);
 		rdn_mem_fini(&fMem);
+		rdn_mem_fini(&fCommandMem);
 		return false;
 	}
 	/*
@@ -313,6 +395,8 @@ bool RadeonNIAccel::startEngine(void)
 	else
 		IOLog("RadeonNI: GART: not started (rdn_gart=0)\n");
 
+	videoReserveStaging();
+
 	/*
 	 * ASIC_Init leaves the card at slow boot clocks. Go to the PowerPlay
 	 * table's performance state: voltage and engine clock, and the
@@ -322,20 +406,34 @@ bool RadeonNIAccel::startEngine(void)
 	 * rdn_mclk=0 only the memory clock.
 	 */
 	fEngineUp = true;
-	if (!PE_parse_boot_arg("rdn_bootclocks", &keepBootClocks) || !keepBootClocks) {
+	bool fanReady = fAccel.card->family != RDN_FAMILY_CAYMAN ||
+		fFramebuffer->getProperty("FanControlReady") == kOSBooleanTrue;
+	if (fAccel.card->family == RDN_FAMILY_TURKS && fanReady && (!PE_parse_boot_arg("rdn_bootclocks", &keepBootClocks) || !keepBootClocks)) {
 		UInt32 sclk = 0, mclk = 0, temperature = 0;
 		UInt32 what = RDN_PM_VOLTAGE | RDN_PM_SCLK;
 		int memoryClock = 1;
 
 		if (!PE_parse_boot_arg("rdn_mclk", &memoryClock))
 			memoryClock = 1;
-		/* MC_SEQ_SUP_CNTL, RUN_MASK */
-		if (memoryClock && (rdn_rreg(fAccel.card, 0x28c8) & 1))
+		if (memoryClock && rdn_pm_memory_clock_ready(fAccel.card))
 			what |= RDN_PM_MCLK;
-		power(RDN_UC_POWER_PERFORMANCE, what, &sclk, &mclk, &temperature);
+		IOReturn result = power(RDN_UC_POWER_PERFORMANCE, what, &sclk, &mclk, &temperature);
+		if (result != kIOReturnSuccess && fAccel.card->family == RDN_FAMILY_CAYMAN) {
+			IOLog("RadeonNI: Cayman performance state rejected (0x%x)\n", result);
+			rdn_accel_fini(&fAccel);
+			fEngineUp = false;
+			return false;
+		}
 		IOLog("RadeonNI: engine clock %lu0 kHz, memory clock %lu0 kHz\n",
 		      sclk, mclk);
 	}
+
+ if (fAccel.card->family == RDN_FAMILY_CAYMAN && !startHardwarePower()) {
+  UInt32 core=0,memory=0,temp=0;
+  (void)power(RDN_UC_POWER_BOOT,RDN_PM_SCLK,&core,&memory,&temp);
+  IOLog("RadeonNI: hardware power management inactive; Cayman core retained at boot clock\n");
+  if(fPowerFault){fEngineUp=false;return false;}
+ }
 
 	if (fFramebuffer->getProperty("AccelSelfTest") == kOSBooleanTrue) {
 		struct rdn_selftest_target t;
@@ -348,6 +446,9 @@ bool RadeonNIAccel::startEngine(void)
 			IOLog("RadeonNI: drawing self-test needs a 32-bit mode\n");
 		}
 	}
+	/* The hang watchdog runs on the power timer; start it if power management did not. */
+	if (fAccel.card->family == RDN_FAMILY_CAYMAN && fHangMs && !ensurePowerTimer())
+		IOLog("RadeonNI: no timer for the GPU hang watchdog\n");
 	return true;
 }
 
@@ -401,7 +502,7 @@ void RadeonNIAccel::startGart(void)
 	if (!r) {
 		rdn_gart_set_page(&fGart, 0, testBus);
 		rdn_gart_flush(&fGart);
-		r = rdn_ib_selftest(&fAccel, rdn_gart_addr(0),
+		r = rdn_ib_selftest(&fAccel, rdn_gart_addr(&fAccel, 0),
 				    (uint32_t *)fGartTest->getBytesNoCopy());
 		if (r)
 			rdn_gart_disable(&fGart);
@@ -421,7 +522,7 @@ void RadeonNIAccel::startGart(void)
 void RadeonNIAccel::gartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages)
 {
 	*on = fGart.ready ? 1 : 0;
-	*gpuStart = (UInt32)RDN_GART_GPU_START;
+	*gpuStart = (UInt32)rdn_gart_gpu_start(&fAccel);
 	*pages = RDN_GART_PAGES;
 }
 
@@ -458,7 +559,13 @@ IOReturn RadeonNIAccel::gartBind(task_t task, UInt64 address, UInt32 size,
 	}
 
 	IOLockLock(fLock);
-	for (slot = 0; slot < kMaxGartBindings && fGartBound[slot].memory; slot++)
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+	if (fRetiring || fQuiesce.internal_hold) {
+		IOLockUnlock(fLock);
+		memory->complete(); memory->release(); return kIOReturnBusy;
+	}
+#endif
+	for (slot = 0; slot < kMaxGartBindings && (fGartBound[slot].memory || fGartBound[slot].vram); slot++)
 		;
 	if (slot == kMaxGartBindings ||
 	    rdn_mem_alloc(&fGartSpace, size, RDN_GART_PAGE_SIZE, &at)) {
@@ -501,27 +608,40 @@ IOReturn RadeonNIAccel::gartBind(task_t task, UInt64 address, UInt32 size,
 
 IOReturn RadeonNIAccel::gartUnbind(UInt32 offset, void *owner)
 {
+    if (fSurfaceGpuStalled) return kIOReturnNotReady;
 	IOMemoryDescriptor *memory = 0;
 	UInt32 slot, done;
 
 	IOLockLock(fLock);
 	for (slot = 0; slot < kMaxGartBindings; slot++)
-		if (fGartBound[slot].memory && fGartBound[slot].offset == offset &&
+		if ((fGartBound[slot].memory || fGartBound[slot].vram) && fGartBound[slot].offset == offset &&
 		    fGartBound[slot].owner == owner)
 			break;
 	if (slot < kMaxGartBindings) {
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+		/* Retain mappings while retirement or a private transfer makes
+		 * hardware completion uncertain. */
+		if (fRetiring || fQuiesce.internal_hold) {
+			fGartBound[slot].owner = 0;
+			IOLockUnlock(fLock); return kIOReturnBusy;
+		}
+#endif
 		for (done = 0; done < fGartBound[slot].size; done += RDN_GART_PAGE_SIZE)
 			rdn_gart_clear_page(&fGart, (offset + done) / RDN_GART_PAGE_SIZE);
-		rdn_gart_flush(&fGart);
+		if (rdn_gart_flush_checked(&fGart)) {
+			fSurfaceGpuStalled = true;
+			setProperty("RadeonNISurfaceGPURebootRequired", kOSBooleanTrue);
+			IOLockUnlock(fLock); return kIOReturnTimeout;
+		}
 		rdn_mem_free(&fGartSpace, offset);
 		memory = fGartBound[slot].memory;
 		fGartBound[slot].memory = 0;
+		fGartBound[slot].vram = 0;
 	}
 	IOLockUnlock(fLock);
-	if (!memory)
+	if (slot == kMaxGartBindings)
 		return kIOReturnBadArgument;
-	memory->complete();
-	memory->release();
+	if (memory) { memory->complete(); memory->release(); }
 	return kIOReturnSuccess;
 }
 
@@ -530,8 +650,16 @@ void RadeonNIAccel::gartUnbindAll(void *owner)
 	UInt32 slot;
 
 	for (slot = 0; slot < kMaxGartBindings; slot++)
-		if (fGartBound[slot].memory && fGartBound[slot].owner == owner)
+		if ((fGartBound[slot].memory || fGartBound[slot].vram) && fGartBound[slot].owner == owner)
 			gartUnbind(fGartBound[slot].offset, owner);
+}
+
+void RadeonNIAccel::clearSurfaceBufferRecord(SurfaceRecord *record)
+{
+    if (record->backingClient) {
+        record->owner = 0; record->producerTask = 0; record->gl = false;
+        record->bufOffset = record->bufRowBytes = record->bufWidth = record->bufHeight = 0;
+    } else bzero(record, sizeof(*record));
 }
 
 void RadeonNIAccel::retainClientMemory(const UInt32 *offsets,UInt32 count,void *owner)
@@ -539,11 +667,11 @@ void RadeonNIAccel::retainClientMemory(const UInt32 *offsets,UInt32 count,void *
  if(!owner) return;
  IOLockLock(fLock);
  for(UInt32 i=0;i<kMaxGartBindings;++i)
-  if(fGartBound[i].memory && fGartBound[i].owner==owner) fGartBound[i].owner=0;
+  if((fGartBound[i].memory || fGartBound[i].vram) && fGartBound[i].owner==owner) fGartBound[i].owner=0;
  for(UInt32 i=0;i<fShapeCapacity;++i) {
-  if(fShapes[i].used && fShapes[i].owner==owner) bzero(&fShapes[i],sizeof(fShapes[i]));
+  if(fShapes[i].used && fShapes[i].owner==owner) clearSurfaceBufferRecord(&fShapes[i]);
   for(UInt32 j=0;fShapes[i].used && j<count;++j)
-   if(fShapes[i].bufWidth && fShapes[i].bufOffset==offsets[j]) bzero(&fShapes[i],sizeof(fShapes[i]));
+   if(fShapes[i].bufWidth && fShapes[i].bufOffset==offsets[j]) clearSurfaceBufferRecord(&fShapes[i]);
  }
  IOLockUnlock(fLock);
 }
@@ -553,15 +681,21 @@ void RadeonNIAccel::releaseClientMemory(const UInt32 *offsets, UInt32 count,
 {
 	UInt32 i, j, fence;
 	bool hasMemory = count != 0;
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+	bool sleepTransferHeld;
+#endif
 
 	IOLockLock(fLock);
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+	sleepTransferHeld = fRetiring || fQuiesce.internal_hold != 0;
+#endif
 	for (i = 0; i < kMaxGartBindings; i++)
-		if (fGartBound[i].memory && fGartBound[i].owner == owner)
+		if ((fGartBound[i].memory || fGartBound[i].vram) && fGartBound[i].owner == owner)
 			hasMemory = true;
 	/* Reservations have no VRAM offset to match during client teardown. */
 	for (i = 0; i < fShapeCapacity; i++)
 		if (fShapes[i].used && fShapes[i].owner == owner)
-			bzero(&fShapes[i], sizeof(fShapes[i]));
+			clearSurfaceBufferRecord(&fShapes[i]);
 	if (!hasMemory) {
 		IOLockUnlock(fLock);
 		return;
@@ -570,13 +704,17 @@ void RadeonNIAccel::releaseClientMemory(const UInt32 *offsets, UInt32 count,
 	for (i = 0; i < fShapeCapacity; i++)
 		for (j = 0; fShapes[i].used && j < count; j++)
 			if (fShapes[i].bufWidth && fShapes[i].bufOffset == offsets[j]) {
-				bzero(&fShapes[i], sizeof(fShapes[i]));
+				clearSurfaceBufferRecord(&fShapes[i]);
 				break;
 			}
 	fence = fAccel.fence_emitted;
 	IOLockUnlock(fLock);
 
-	if (!fenceWait(fence, 10000)) {
+	if (fSurfaceGpuStalled ||
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+	    sleepTransferHeld ||
+#endif
+	    !fenceWait(fence, 10000)) {
 		/* Keep GPU-visible memory pinned until reboot after a hang. */
 		retainClientMemory(offsets,count,owner);
 		IOLog("RadeonNI: client cleanup fence %lu timed out; retaining GPU memory\n", fence);
@@ -587,8 +725,23 @@ void RadeonNIAccel::releaseClientMemory(const UInt32 *offsets, UInt32 count,
 	gartUnbindAll(owner);
 }
 
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+void RadeonNIAccel::beginExperimentalRetirement(void)
+{
+	if (!fLock) return;
+	IOLockLock(fLock);
+	fRetiring = true;
+	IOLockWakeup(fLock, &fFenceEvents, false);
+	IOLockUnlock(fLock);
+}
+#endif
+
 void RadeonNIAccel::prepareToRetire(void)
 {
+	IOLockLock(fLock); fRetiring = true; IOLockUnlock(fLock);
+	stopFenceInterrupts();
+	stopIdleGovernor();
+	stopHardwarePower();
 	IOLockLock(fLock);
 	fRetiring = true;
 	IOLockUnlock(fLock);
@@ -624,6 +777,7 @@ void RadeonNIAccel::retire(IOService *provider)
 		}
 		fUvdSeg = 0;
 		rdn_accel_fini(&fAccel);
+		rdn_mem_fini(&fCommandMem);
 		rdn_mem_fini(&fMem);
 		if (fHiddenSize) {
 			rdn_mem_fini(&fHidden);
@@ -664,8 +818,16 @@ void RadeonNIAccel::retire(IOService *provider)
 
 void RadeonNIAccel::free(void)
 {
+	stopFenceInterrupts();
+	while (fRetiredVram) {
+		RetiredVram *entry = fRetiredVram;
+		fRetiredVram = entry->next; IOFree(entry, sizeof(*entry));
+	}
+	stopIdleGovernor();
+	stopHardwarePower();
 	if (fLock) IOLockFree(fLock);
 	if (fUvdLock) IOLockFree(fUvdLock);
+	if (fFenceControlLock) IOLockFree(fFenceControlLock);
 	super::free();
 }
 
@@ -682,7 +844,7 @@ void RadeonNIAccel::uvdDiagnosticInfo(struct rdn_user_uvd_diagnostic *info)
 		if (firmware && firmware->getLength())
 			info->flags |= RDN_UVD_DIAGNOSTIC_FIRMWARE;
 		OSData *rlc = OSDynamicCast(OSData, fFramebuffer->getProperty("FW_RLC"));
-		if (rlc && rlc->getLength() == 3072)
+		if (rlc && rlc->getLength() == rdn_uvd_rlc_bytes(fAccel.card))
 			info->flags |= RDN_UVD_DIAGNOSTIC_RLC_FIRMWARE;
 	}
 	info->state = fUvdState;
@@ -691,6 +853,24 @@ void RadeonNIAccel::uvdDiagnosticInfo(struct rdn_user_uvd_diagnostic *info)
 	info->reserved_bytes = fUvdBytes;
 	IOLockUnlock(fLock);
 	IOLockUnlock(fUvdLock);
+}
+
+void RadeonNIAccel::prepareBeforeCP(void *cookie)
+{
+	RadeonNIAccel *accel = static_cast<RadeonNIAccel *>(cookie);
+	int irq = 0;
+	PE_parse_boot_arg("rdn_irq", &irq);
+	if (irq) {
+		UInt32 size = 0;
+		void *firmware = accel->copyFirmware("FW_RLC", &size);
+		int result = rdn_rlc_start(&accel->fAccel, (const uint8_t *)firmware, size);
+		if (firmware) IOFree(firmware, size);
+		accel->fFenceRlcPrepared = result == 0;
+		IOLog("RadeonNI: RLC before CP: %d\n", result);
+	}
+	if (accel->fFramebuffer->getProperty("EnableUVDDiagnostics") == kOSBooleanTrue &&
+	    accel->fFramebuffer->getProperty("UVDDiagnosticsBeforeCP") == kOSBooleanTrue)
+		prepareUvdBeforeCP(cookie);
 }
 
 void RadeonNIAccel::prepareUvdBeforeCP(void *cookie)
@@ -767,7 +947,7 @@ IOReturn RadeonNIAccel::uvdDiagnosticInitImpl(UInt32 *status, bool prepareOnly)
 		result = kIOReturnNotFound;
 		goto out;
 	}
-	if (rlcSize != 3072) {
+	if (rlcSize != rdn_uvd_rlc_bytes(fAccel.card)) {
 		result = kIOReturnBadArgument;
 		goto out;
 	}
@@ -962,6 +1142,37 @@ void RadeonNIAccel::getInfo(struct rdn_user_info *info)
 	IOLockUnlock(fLock);
 }
 
+static void memoryBytes(struct rdn_user_bytes *out, uint64_t value)
+{
+ out->hi = (uint32_t)(value >> 32);
+ out->lo = (uint32_t)value;
+}
+
+void RadeonNIAccel::memoryUsage(struct rdn_user_memory_usage *info)
+{
+ bzero(info, sizeof(*info));
+ IOLockLock(fLock);
+ const uint64_t visible = rdn_mem_available(&fMem);
+ const uint64_t hidden = fHiddenSize ? rdn_mem_available(&fHidden) : 0;
+ const uint64_t command = rdn_mem_available(&fCommandMem);
+ const uint64_t capacity = fMem.size + fHiddenSize + fCommandMem.size;
+ info->version = 1;
+ info->size = sizeof(*info);
+ memoryBytes(&info->total, fAccel.vram_size);
+ memoryBytes(&info->reserved, fAccel.vram_size - capacity);
+ memoryBytes(&info->allocated, capacity - visible - hidden - command);
+ memoryBytes(&info->free, visible + hidden + command);
+ memoryBytes(&info->visible_capacity, fMem.size);
+ memoryBytes(&info->visible_free, visible);
+ memoryBytes(&info->visible_largest, rdn_mem_largest(&fMem));
+ memoryBytes(&info->hidden_capacity, fHiddenSize);
+ memoryBytes(&info->hidden_free, hidden);
+ memoryBytes(&info->hidden_largest, fHiddenSize ? rdn_mem_largest(&fHidden) : 0);
+ memoryBytes(&info->command_capacity, fCommandMem.size);
+ memoryBytes(&info->command_free, command);
+ IOLockUnlock(fLock);
+}
+
 void RadeonNIAccel::hiddenInfo(UInt32 *offset, UInt32 *size)
 {
 	*offset = fHiddenOffset;
@@ -969,7 +1180,7 @@ void RadeonNIAccel::hiddenInfo(UInt32 *offset, UInt32 *size)
 }
 
 IOReturn RadeonNIAccel::allocVram(UInt32 size, UInt32 align, UInt32 *offset,
-				  bool hidden, bool segment)
+				  bool hidden, bool segment, bool command)
 {
 	uint64_t off = 0;
 	int r;
@@ -981,7 +1192,13 @@ IOReturn RadeonNIAccel::allocVram(UInt32 size, UInt32 align, UInt32 *offset,
 	if ((hidden || segment) && !fHiddenSize)
 		return kIOReturnNoMemory;
 	IOLockLock(fLock);
-	if (segment) {
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+	if (fRetiring || fQuiesce.internal_hold) { IOLockUnlock(fLock); return kIOReturnBusy; }
+#endif
+	reapRetiredVram();
+	if (command) {
+		r = rdn_mem_alloc(&fCommandMem, size, align, &off);
+	} else if (segment) {
 		/* the decoder's own 256 MB (docs/UVD.md) */
 		r = (fUvdSeg || fUvdSplit) ? rdn_mem_alloc_range(fUvdSegMem, size, align, fUvdSegLo, fUvdSegHi, &off) : -1;
 	} else if (hidden && (fUvdSeg || fUvdSplit) && fUvdSegMem == &fHidden) {
@@ -1002,13 +1219,45 @@ IOReturn RadeonNIAccel::allocVram(UInt32 size, UInt32 align, UInt32 *offset,
 	return kIOReturnSuccess;
 }
 
+struct rdn_mem *RadeonNIAccel::heapForOffset(UInt32 offset)
+{
+ if (offset >= HEAP_OFFSET && offset < HEAP_OFFSET + COMMAND_BYTES) return &fCommandMem;
+ return fHiddenSize && offset >= fHiddenOffset ? &fHidden : &fMem;
+}
+
+void RadeonNIAccel::reapRetiredVram()
+{
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+	if (fRetiring || fQuiesce.internal_hold) return;
+#endif
+	RetiredVram **link = &fRetiredVram;
+	while (*link) {
+		RetiredVram *entry = *link;
+		if (!rdn_fence_done(&fAccel, entry->fence)) { link = &entry->next; continue; }
+		rdn_mem_free(heapForOffset(entry->offset),
+		             entry->offset);
+		*link = entry->next;
+		IOFree(entry, sizeof(*entry));
+	}
+}
+
 void RadeonNIAccel::freeVram(UInt32 offset)
 {
 	IOLockLock(fLock);
-	if (fHiddenSize && offset >= fHiddenOffset)
-		rdn_mem_free(&fHidden, offset);
-	else
-		rdn_mem_free(&fMem, offset);
+	if (fSurfaceGpuStalled) { IOLockUnlock(fLock); return; }
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+	if (fRetiring || fQuiesce.internal_hold) { IOLockUnlock(fLock); return; }
+#endif
+	for (UInt32 i = 0; i < kSurfaceMirrors; ++i)
+		if (fSurfaceMirrors[i].offset == offset) fSurfaceMirrors[i].surface = 0;
+	if (!rdn_fence_done(&fAccel, fAccel.fence_emitted)) {
+		RetiredVram *entry = (RetiredVram *)IOMalloc(sizeof(*entry));
+		if (entry) {
+			entry->offset = offset; entry->fence = fAccel.fence_emitted;
+			entry->next = fRetiredVram; fRetiredVram = entry;
+		} else IOLog("RadeonNI: retaining busy VRAM after retirement allocation failed\n");
+	} else rdn_mem_free(heapForOffset(offset), offset);
+	reapRetiredVram();
 	IOLockUnlock(fLock);
 }
 
@@ -1021,6 +1270,7 @@ IOReturn RadeonNIAccel::submit(UInt32 offset, UInt32 words, UInt32 *fence)
 	    words > (fAccel.aperture_size - offset) / 4)
 		return kIOReturnBadArgument;
 	IOLockLock(fLock);
+	if (fSurfaceGpuStalled || fRetiring) { IOLockUnlock(fLock); return kIOReturnNotReady; }
 	r = rdn_ib_submit(&fAccel, rdn_vram_addr(&fAccel, offset), words, &seq);
 	IOLockUnlock(fLock);
 	if (r)
@@ -1218,7 +1468,7 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 		}
 		rdn_gart_flush(&fGart);
 		cpu = (volatile uint8_t *)mem->getBytesNoCopy();
-		gpu = rdn_gart_addr((UInt32)(at / 4096));
+		gpu = rdn_gart_addr(&fAccel, (UInt32)(at / 4096));
 		IOLog("RadeonNI: UVD (GART): firmware %lu bytes, memory at GPU 0x%lx%08lx, reference clock %lu0 kHz; starting\n",
 		      (unsigned long)fwSize, (unsigned long)(gpu >> 32), (unsigned long)gpu,
 		      (unsigned long)ref);
@@ -1450,7 +1700,7 @@ bool RadeonNIAccel::dmaStageUp(void)
 	rdn_gart_flush(&fGart);
 	fDmaMem = mem;
 	fDmaCpu = (UInt8 *)mem->getBytesNoCopy();
-	fDmaGpu = rdn_gart_addr((UInt32)(at / 4096));
+	fDmaGpu = rdn_gart_addr(&fAccel, (UInt32)(at / 4096));
 	fDmaAt = (UInt32)at;
 	fDmaBytes = total;
 	IOLockUnlock(fLock);
@@ -1886,7 +2136,7 @@ bool RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch
 		return false;
 	}
 	if (!fUvdClocksUp && count) {
-		fUvdClocksUp = rdn_uvd_wake(&fUvd) == 0;
+		fUvdClocksUp = !prepareVideoPower(true) && rdn_uvd_wake(&fUvd) == 0;
 		if (!fUvdClocksUp) safe=false;
 	}
 	for (i = 0; safe && i < count; i++) {
@@ -2003,7 +2253,8 @@ IOReturn RadeonNIAccel::uvdSubmitCommon(uint64_t ibAddress, UInt32 words, UvdMsg
 		*epoch = fUvdEpoch;
 	}
 	if (!fUvdClocksUp) {
-		r = rdn_uvd_wake(&fUvd);
+		r = prepareVideoPower(true);
+  if(!r)r = rdn_uvd_wake(&fUvd);
 		fUvdClocksUp = r == 0;
 		if (fUvd.flags & RDN_UVD_F_PLL)
 			IOLog("RadeonNI: UVD clocks %s\n", r ? "did not come up" : "up");
@@ -2509,25 +2760,44 @@ IOReturn RadeonNIAccel::uvdInfo(UInt32 *up, UInt32 *vcpuOffset, UInt32 *ringOffs
 	return kIOReturnSuccess;
 }
 
-/*
- * Polls, giving up the CPU between looks: there is no interrupt yet. A
- * timeout of zero only asks.
- */
+/* Wait for completion by IRQ or polling; a zero timeout only queries. */
 bool RadeonNIAccel::fenceWait(UInt32 fence, UInt32 timeoutMs)
 {
-	UInt32 waited = 0;
-	bool done;
-
+	UInt64 end = 0;
+	if (timeoutMs) clock_interval_to_deadline(timeoutMs, kMillisecondScale, &end);
+	IOLockLock(fLock);
 	for (;;) {
-		IOLockLock(fLock);
-		done = rdn_fence_done(&fAccel, fence);
-		if (done)
-			rdn_hdp_flush(&fAccel);
-		IOLockUnlock(fLock);
-		if (done || waited >= timeoutMs)
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+		/* A teardown or private transfer may have begun while this thread
+		 * slept. Check before touching the device, while holding fLock. */
+		if (fRetiring || fSurfaceGpuStalled || fQuiesce.internal_hold) {
+			IOLockUnlock(fLock); return false;
+		}
+#endif
+		bool done = fEngineUp && rdn_fence_done(&fAccel, fence);
+		if (done) rdn_hdp_flush(&fAccel);
+		UInt64 now; clock_get_uptime(&now);
+		if (done || !timeoutMs || now >= end || fRetiring || fSurfaceGpuStalled) {
+			IOLockUnlock(fLock);
 			return done;
-		IOSleep(1);
-		waited++;
+		}
+		if (fFenceIRQEnabled) {
+			UInt64 fallback; clock_interval_to_deadline(5, kMillisecondScale, &fallback);
+			if (fallback > end) fallback = end;
+			UInt32 events = fFenceEvents;
+			AbsoluteTime deadline; bcopy(&fallback, &deadline, sizeof(deadline));
+			IOLockSleepDeadline(fLock, &fFenceEvents, deadline, THREAD_UNINT);
+			if (events == fFenceEvents &&
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+			    !fRetiring && !fSurfaceGpuStalled && !fQuiesce.internal_hold &&
+#endif
+			    rdn_fence_done(&fAccel, fence))
+				fFenceFallbacks++;
+		} else {
+			IOLockUnlock(fLock);
+			IOSleep(1);
+			IOLockLock(fLock);
+		}
 	}
 }
 
@@ -2536,18 +2806,582 @@ bool RadeonNIAccel::fenceWait(UInt32 fence, UInt32 timeoutMs)
  * lock keeps new command buffers out; what is already running gets half a
  * second to finish.
  */
+bool RadeonNIAccel::ensurePowerTimer()
+{
+ if(fPowerLoop && fPowerTimer)return true;
+ fPowerLoop=IOWorkLoop::workLoop();if(!fPowerLoop)return false;
+ fPowerTimer=IOTimerEventSource::timerEventSource(this,powerTimerFired);
+ if(!fPowerTimer || fPowerLoop->addEventSource(fPowerTimer)!=kIOReturnSuccess) {
+  if(fPowerTimer){fPowerTimer->release();fPowerTimer=0;}
+  fPowerLoop->release();fPowerLoop=0;return false;
+ }
+ fPowerTimer->setTimeoutMS(250);return true;
+}
+void RadeonNIAccel::pollClockTuning()
+{
+ struct rdn_card *card=fAccel.card;
+ UInt64 now=card->os->time_ms(card->os->cookie);uint32_t raw=rdn_rreg(card,0x740);
+ int temp=rdn_pm_temperature(card);
+ if(now<fTuneDeadline && temp<75000 && !((raw>>16)&0x600))return;
+ if(!fFramebuffer->tryPowerLock())return;
+ bool idle=false;
+ for(unsigned i=0;i<500;i++) {
+  if(rdn_fence_done(&fAccel,fAccel.fence_emitted)){idle=true;break;}
+  IOSleep(1);
+ }
+ uint32_t actualCore=0,actualMemory=0;
+ int result=-16;
+ if(idle) {
+  result=rdn_pm_get_clocks(card,&actualCore,&actualMemory);
+  if(!result && actualCore && actualMemory) {
+   fPower.sclk=actualCore;fPower.mclk=actualMemory;
+   result=rdn_pm_set(card,&fPower,&fTuneStock,RDN_PM_SCLK|RDN_PM_MCLK);
+  }else if(!result)result=-5;
+ }
+ if(!result) {
+  uint32_t s=0,m=0;rdn_pm_get_clocks(card,&s,&m);
+  if((s>fTuneStock.sclk?s-fTuneStock.sclk:fTuneStock.sclk-s)>100 ||
+     (m>fTuneStock.mclk?m-fTuneStock.mclk:fTuneStock.mclk-m)>100)result=-5;
+ }
+ fFramebuffer->unlockPower();
+ if(!result) {
+  fPower=fTuneStock;fClockTuning=false;setProperty("ClockTuningActive",false);
+  setProperty("PowerCoreClock10KHz",(UInt64)fPower.sclk,32);
+  setProperty("PowerMemoryClock10KHz",(UInt64)fPower.mclk,32);
+  IOLog("RadeonNI: clock tuning lease ended; restored BIOS performance clocks\n");
+ }else setProperty("ClockTuningRestoreError",(UInt64)(SInt64)result,32);
+}
+
+bool RadeonNIAccel::startHardwarePower(bool diagnostic)
+{
+#if !RDN_CAYMAN_SMC
+ return false;
+#endif
+ int enable=0;
+ if (!diagnostic && (!PE_parse_boot_arg("rdn_dpm",&enable) || enable!=1))
+  return false;
+ /* Memory transitions and gating remain diagnostic until hardware-qualified. */
+ int memoryDpm=0,graphicsGating=0,idleDpm=0;
+ PE_parse_boot_arg("rdn_memdpm",&memoryDpm);PE_parse_boot_arg("rdn_gfxcg",&graphicsGating);
+ PE_parse_boot_arg("rdn_idle",&idleDpm);
+ fAccel.card->power_memory_dpm=memoryDpm==1;
+ fAccel.card->power_graphics_gating=graphicsGating==1;
+ fAccel.card->power_idle_dpm=idleDpm==1;
+ if(!fEngineUp || fFramebuffer->getProperty("FanControlReady")!=kOSBooleanTrue)
+  return false;
+ UInt32 bytes=0;void *firmware=copyFirmware("FW_SMC",&bytes);
+ if(!firmware)return false;
+ IOLockLock(fLock);
+ int result=-16;
+ if(fHardwarePower && fHardwarePower->enabled) {
+  IOLockUnlock(fLock);IOFree(firmware,bytes);return true;
+ }
+ if(fHardwarePower && fHardwarePower->touched) {
+  IOLockUnlock(fLock);IOFree(firmware,bytes);return false;
+ }
+ if(fHardwarePower)IOFree(fHardwarePower,sizeof(*fHardwarePower));
+ fHardwarePower=(struct rdn_cayman_dpm *)IOMalloc(sizeof(*fHardwarePower));
+ if(!fHardwarePower){IOLockUnlock(fLock);IOFree(firmware,bytes);return false;}
+ bzero(fHardwarePower,sizeof(*fHardwarePower));
+ if(fFramebuffer->tryPowerLock()) {
+  struct rdn_pm_state before,fast;
+  bool clocksTouched = false;
+  uint32_t raw = rdn_rreg(fAccel.card, 0x740);
+  result = (fVideoBusy || ((raw >> 16) & 0x600) ||
+            rdn_pm_temperature(fAccel.card) >= 80000) ? -16 : 0;
+  /* Retire queued work before ATOM changes the memory clock. */
+  if (!result) {
+   bool idle = false;
+   for (unsigned i = 0; i < 500; ++i) {
+    if (rdn_fence_done(&fAccel, fAccel.fence_emitted)) { idle = true; break; }
+    IOSleep(1);
+   }
+   if (!idle) result = -16;
+  }
+  if (!result) result=rdn_pm_boot_state(fAccel.card,&before);
+  if(!result)result=rdn_pm_get_clocks(fAccel.card,&before.sclk,&before.mclk);
+  if(!result)result=rdn_pm_performance_state(fAccel.card,&fast);
+  if(!result)result=rdn_pm_resolve_state(fAccel.card,&fast);
+  if(!result) {
+   IOLog("RadeonNI: SMC prepare: BIOS performance transition\n");
+   clocksTouched = true;
+   result=rdn_pm_set(fAccel.card,&before,&fast,RDN_PM_ALL);
+  }
+  if(!result)result=rdn_cayman_dpm_prepare(fAccel.card,fHardwarePower);
+  if(!result)result=rdn_cayman_dpm_enable(fAccel.card,fHardwarePower,firmware,bytes);
+  if(result && clocksTouched && !fHardwarePower->touched) {
+   struct rdn_pm_state low;
+   if(!rdn_pm_boot_state(fAccel.card,&low) && !rdn_pm_get_clocks(fAccel.card,&before.sclk,&before.mclk)) {
+    int capped=rdn_pm_set(fAccel.card,&before,&low,RDN_PM_SCLK);
+    if(capped)fPowerFault=true;
+   }
+  }
+  fFramebuffer->unlockPower();
+ }
+ IOLockUnlock(fLock);IOFree(firmware,bytes);
+ setProperty("HardwarePowerError",(UInt64)(SInt64)result,32);
+ setProperty("HardwarePowerManagement",!result);
+ setProperty("PerformanceModeSupported",!result);
+ setProperty("PerformanceMode",false);
+ setProperty("HardwareThermalProtection",!result);
+ setProperty("HardwarePowerContainment",!result);
+ if(result){
+  IOLog("RadeonNI: Cayman SMC startup failed (%d)\n",result);
+  fPower=fHardwarePower->performance;
+  rdn_pm_get_clocks(fAccel.card,&fPower.sclk,&fPower.mclk);fPowerKnown=true;
+  if(fHardwarePower->touched)fPowerFault=true;
+  if(fPowerFault){fAccel.before_submit=powerBeforeSubmit;fAccel.submit_cookie=this;}
+  return false;
+ }
+ fPowerKnown=false;
+ fPowerLoop=IOWorkLoop::workLoop();
+ fPowerTimer=IOTimerEventSource::timerEventSource(this,powerTimerFired);
+ if(!fPowerLoop || !fPowerTimer || fPowerLoop->addEventSource(fPowerTimer)!=kIOReturnSuccess) {
+  stopIdleGovernor();stopHardwarePower();
+  rdn_pm_get_clocks(fAccel.card,&fPower.sclk,&fPower.mclk);fPowerKnown=true;
+  return false;
+ }
+ fAccel.before_submit=powerBeforeSubmit;fAccel.submit_cookie=this;
+ setProperty("ThermalLimitC",(UInt64)RDN_THERMAL_LIMIT_DEFAULT,32);
+ setProperty("ThermalLimitMinC",(UInt64)RDN_THERMAL_LIMIT_MIN,32);
+ setProperty("ThermalLimitMaxC",(UInt64)RDN_THERMAL_LIMIT_MAX,32);
+ setProperty("ThermalStage",(UInt64)0,32);setProperty("ThermalFallback",false);
+ setProperty("HardwarePowerFault",false);
+ setProperty("CoolingCoreMHz",(UInt64)(fHardwarePower->idle.sclk/100),32);
+ setProperty("IntermediateCoreMHz",(UInt64)(fHardwarePower->intermediate.sclk/100),32);
+ setProperty("PowerLimitWatts",(UInt64)fHardwarePower->calibration.tdp,32);
+ setProperty("NearPowerLimitWatts",(UInt64)fHardwarePower->calibration.near_tdp,32);
+ setProperty("IdleMemoryClockFixed",!fHardwarePower->memory_enabled);
+ setProperty("MemoryDPM",fHardwarePower->memory_enabled);
+ setProperty("BIOSVideoStateSupported",fHardwarePower->video_supported);
+ setProperty("BIOSULVStateSupported",fHardwarePower->ulv_supported);
+ setProperty("GraphicsClockGating",fHardwarePower->gating.enabled);
+ setProperty("MediumGrainClockGating",fHardwarePower->gating.enabled);
+ setProperty("DynamicFanControl",true);
+ fPowerTimer->setTimeoutMS(250);
+ return true;
+}
+void RadeonNIAccel::pollHardwarePower()
+{
+ struct rdn_card *card=fAccel.card;
+ int temp=rdn_pm_temperature(card);uint32_t raw=rdn_rreg(card,0x740);
+ bool invalid=((raw>>16)&0x600)!=0;
+ unsigned limit=RDN_THERMAL_LIMIT_DEFAULT;OSNumber *configured=OSDynamicCast(OSNumber,getProperty("ThermalLimitC"));
+ if(configured)limit=configured->unsigned32BitValue();
+ if(limit<RDN_THERMAL_LIMIT_MIN || limit>RDN_THERMAL_LIMIT_MAX)limit=RDN_THERMAL_LIMIT_DEFAULT;
+ uint64_t now=card->os->time_ms(card->os->cookie);
+ if(fHardwarePower->undervolt_deadline && (now>=fHardwarePower->undervolt_deadline || invalid || temp>=(int)limit*1000)) {
+  int result=rdn_cayman_dpm_voltage(card,fHardwarePower,fHardwarePower->performance.vddc);
+  if(result){fPowerFault=true;setProperty("HardwarePowerFault",true);setProperty("HardwarePowerError",(UInt64)(SInt64)result,32);}
+  else {fHardwarePower->undervolt_deadline=0;setProperty("UndervoltActive",false);fManualPowerCap=true;setProperty("ManualPowerCap",true);}
+ }
+ unsigned previous=fHardwarePower->thermal_stage;
+ unsigned stage=rdn_cayman_thermal_stage(temp,limit,previous,invalid || fPowerFault);
+ fHardwarePower->thermal_stage=stage;
+ bool video=fUvdLive!=0 || fVideoBusy || (fLastVideoPowerWork && now-fLastVideoPowerWork<1000),contextChanged=false;
+ unsigned mask=0,blank=0;rdn_cayman_memory_display(card,&mask,&blank);
+ bool idle=card->power_idle_dpm && !video && now-fLastPowerWork>=2000 && rdn_fence_done(&fAccel,fAccel.fence_emitted);
+ bool idleChanged=fHardwarePower->idle_requested!=idle;fHardwarePower->idle_requested=idle;
+ if(rdn_fence_done(&fAccel,fAccel.fence_emitted) && !fPowerFault) {
+  unsigned oldMask=fHardwarePower->display_mask,oldStage=fHardwarePower->context_thermal_stage;
+  bool oldMemory=fHardwarePower->memory_enabled,oldVideo=fHardwarePower->video,oldChanging=fHardwarePower->display_changing;
+  int context=rdn_cayman_dpm_context(card,fHardwarePower,video,false);
+  setProperty("PowerPlayContextError",(UInt64)(SInt64)context,32);
+  if(!context) {
+   contextChanged=oldMask!=mask || oldStage!=stage || oldMemory!=fHardwarePower->memory_enabled || oldVideo!=video || oldChanging;
+   setProperty("MemoryDPM",fHardwarePower->memory_enabled);setProperty("IdleMemoryClockFixed",!fHardwarePower->memory_enabled);
+   setProperty("BIOSVideoStateActive",video);
+   setProperty("MemoryLowClock10KHz",(UInt64)fHardwarePower->levels[0].mclk,32);
+   if(!fHardwarePower->undervolt_deadline)setProperty("UndervoltActive",false);
+  }
+  if(fHardwarePower->voltage_fault){fPowerFault=true;setProperty("HardwarePowerFault",true);}
+ }
+ if(stage!=previous || idleChanged || contextChanged) {
+  int result=rdn_cayman_dpm_policy(card,fHardwarePower,fPerformanceMode,fManualPowerCap);
+  if(result){fHardwarePower->thermal_stage=previous;fPowerFault=true;setProperty("HardwarePowerFault",true);setProperty("HardwarePowerError",(UInt64)(SInt64)result,32);}
+  else {fThermalFallback=stage!=0;setProperty("ThermalFallback",fThermalFallback);setProperty("ThermalStage",(UInt64)stage,32);}
+ }
+ setProperty("PowerPlayIdle",idle);setProperty("ActivePowerDisplayMask",(UInt64)mask,32);setProperty("MemorySwitchBlankingUS",(UInt64)blank,32);
+ int fan=rdn_cayman_dpm_fan(card,fHardwarePower,temp,limit,invalid || fPowerFault);
+ setProperty("FanControlError",(UInt64)(SInt64)fan,32);
+ fFramebuffer->setProperty("FanRequestedPercent",(UInt64)fHardwarePower->fan_percent,32);
+ if(fan){fManualPowerCap=true;setProperty("FanSafetyCap",true);setProperty("ManualPowerCap",true);(void)rdn_cayman_dpm_force_low(card,true);}
+ if((rdn_rreg(card,0x208)&0x801)!=0x801 || (rdn_rreg(card,0x63c)&5)!=1) {fPowerFault=true;setProperty("HardwarePowerFault",true);}
+ if((fPowerPolls++&3)==0) {
+  setProperty("TemperatureMilliC",(UInt64)(SInt64)temp,32);
+  unsigned index=(rdn_rreg(card,0x66c)>>4)&15;setProperty("PowerStateIndex",(UInt64)index,32);
+  if(index<3)setProperty("PowerCoreVoltageMV",(UInt64)fHardwarePower->calibration.voltage[fHardwarePower->table.dpmLevels[index].vddc.index],32);
+  uint32_t estimate=0;
+  if(!rdn_smc_read(card,fHardwarePower->cac_addr+offsetof(PP_NIslands_CACTABLES,avg_power_TDP),&estimate)) {
+   unsigned factor=132*((1000000000u/fHardwarePower->calibration.xclk)/10000u);
+   if(factor)setProperty("EstimatedPowerMilliWatts",(UInt64)estimate*1000/(factor*4),32);
+  }
+ }
+}
+int RadeonNIAccel::prepareVideoPower(bool alreadyLocked)
+{
+ if(!alreadyLocked)IOLockLock(fLock);
+ int result=0;
+ if(fHardwarePower && fHardwarePower->enabled) {
+  if(fPowerFault)result=-EIO;
+  else if(!fFramebuffer->tryPowerLock())result=-EBUSY;
+  else {
+   fLastVideoPowerWork=fAccel.card->os->time_ms(fAccel.card->os->cookie);
+   result=rdn_cayman_dpm_context(fAccel.card,fHardwarePower,true,false);
+   if(!result){fHardwarePower->idle_requested=false;result=rdn_cayman_dpm_policy(fAccel.card,fHardwarePower,fPerformanceMode,fManualPowerCap);}
+   setProperty("VideoPowerError",(UInt64)(SInt64)result,32);
+   if(fHardwarePower->voltage_fault){fPowerFault=true;setProperty("HardwarePowerFault",true);}
+   fFramebuffer->unlockPower();
+  }
+ }
+ if(!alreadyLocked)IOLockUnlock(fLock);
+ return result;
+}
+IOReturn RadeonNIAccel::beginDisplayPowerChange()
+{
+ if(!fHardwarePower || !fHardwarePower->enabled)return kIOReturnSuccess;
+ if(!IOLockTryLock(fLock))return kIOReturnBusy;
+ if(fRetiring || fPowerFault){IOLockUnlock(fLock);return kIOReturnNotReady;}
+ int result=rdn_fence_wait(&fAccel,fAccel.fence_emitted,100);
+ if(!result && fUvdLastSeq && fUvdUp)result=rdn_uvd_fence_wait(&fUvd,fUvdLastSeq,100);
+ if(!result)result=rdn_cayman_dpm_context(fAccel.card,fHardwarePower,fUvdLive!=0 || fVideoBusy,true);
+ if(!result) {
+  unsigned i;
+  for(i=0;i<100;i++) {
+   uint32_t sc=0,mc=0;
+   if(!rdn_pm_get_clocks(fAccel.card,&sc,&mc) && mc+100>=fHardwarePower->performance.mclk)break;
+   IOSleep(1);
+  }
+  if(i==100)result=-110;
+ }
+ if(result){
+  if(!fHardwarePower->voltage_fault){(void)rdn_cayman_dpm_context(fAccel.card,fHardwarePower,fUvdLive!=0 || fVideoBusy,false);(void)rdn_cayman_dpm_policy(fAccel.card,fHardwarePower,fPerformanceMode,fManualPowerCap);}
+  if(fHardwarePower->voltage_fault){fPowerFault=true;setProperty("HardwarePowerFault",true);}
+  IOLockUnlock(fLock);return kIOReturnIOError;
+ }
+ fDisplayPowerHeld=true;return kIOReturnSuccess;
+}
+void RadeonNIAccel::endDisplayPowerChange()
+{
+ if(!fDisplayPowerHeld)return;
+ int result=rdn_cayman_dpm_context(fAccel.card,fHardwarePower,fUvdLive!=0 || fVideoBusy,false);
+ if(!result)result=rdn_cayman_dpm_policy(fAccel.card,fHardwarePower,fPerformanceMode,fManualPowerCap);
+ setProperty("DisplayPowerError",(UInt64)(SInt64)result,32);
+ if(fHardwarePower->voltage_fault){fPowerFault=true;setProperty("HardwarePowerFault",true);}
+ fDisplayPowerHeld=false;IOLockUnlock(fLock);
+}
+void RadeonNIAccel::stopHardwarePower()
+{
+ if(!fHardwarePower)return;
+ if(fLock)IOLockLock(fLock);
+ fFramebuffer->lockPower();
+ int result=rdn_cayman_dpm_disable(fAccel.card,fHardwarePower);
+ fFramebuffer->unlockPower();
+ if(result) {
+  IOLog("RadeonNI: SMC halt failed (%d); firmware and power state retained\n",result);
+  fPowerFault=true;setProperty("HardwarePowerFault",true);
+  if(fLock)IOLockUnlock(fLock);
+  return;
+ }
+ setProperty("HardwarePowerManagement",false);
+ if(fLock)IOLockUnlock(fLock);
+ IOFree(fHardwarePower,sizeof(*fHardwarePower));fHardwarePower=0;
+}
+
+int RadeonNIAccel::applyGovernorPower(const struct rdn_pm_state *target)
+{
+	if (!fFramebuffer->tryPowerLock())
+		return -EBUSY;
+	int r = rdn_pm_set(fAccel.card, &fPower, target, RDN_PM_VOLTAGE | RDN_PM_SCLK);
+	fFramebuffer->unlockPower();
+	if (!r) {
+		fPower = *target;
+		fPowerIdle = target == &fIdlePower;
+		setProperty("PowerIdle", fPowerIdle);
+		setProperty("PowerCoreClock10KHz", (UInt64)fPower.sclk, 32);
+		setProperty("PowerCoreVoltageMV", (UInt64)fPower.vddc, 32);
+	} else if (r != -EBUSY) {
+		fPowerFault = true;
+		setProperty("IdleGovernorError", (UInt64)(SInt64)r, 32);
+		IOLog("RadeonNI: idle governor transition failed (%d); submissions blocked\n", r);
+	}
+	return r;
+}
+
+int RadeonNIAccel::powerBeforeSubmit(void *cookie)
+{
+	RadeonNIAccel *self = (RadeonNIAccel *)cookie;
+	self->fLastPowerWork = self->fAccel.card->os->time_ms(self->fAccel.card->os->cookie);
+	if (self->fPowerFault)
+		return -EIO;
+ if(self->fHardwarePower && self->fHardwarePower->enabled && self->fHardwarePower->idle_requested) {
+  if(!self->fFramebuffer->tryPowerLock())return -EBUSY;
+  self->fHardwarePower->idle_requested=false;
+  int result=rdn_cayman_dpm_policy(self->fAccel.card,self->fHardwarePower,self->fPerformanceMode,self->fManualPowerCap);
+  self->fFramebuffer->unlockPower();return result;
+ }
+	if (!self->fIdleGovernor || !self->fPowerIdle)
+		return 0;
+	return self->applyGovernorPower(&self->fPerformancePower);
+}
+
+void RadeonNIAccel::powerTimerFired(OSObject *owner, IOTimerEventSource *sender)
+{
+	RadeonNIAccel *self = OSDynamicCast(RadeonNIAccel, owner);
+	if (!self)
+		return;
+	IOLockLock(self->fLock);
+	if(self->fClockTuning && !self->fRetiring)self->pollClockTuning();
+	if (self->fHardwarePower && self->fHardwarePower->enabled && !self->fRetiring && self->fFramebuffer->tryPowerLock()) {
+  self->pollHardwarePower();self->fFramebuffer->unlockPower();
+ }
+	if (self->fIdleGovernor && !self->fPowerFault && !self->fPowerIdle &&
+	    !self->fRetiring && self->fEngineUp && !self->fVideoBusy && !self->fUvdUp) {
+		UInt64 now = self->fAccel.card->os->time_ms(self->fAccel.card->os->cookie);
+		if (now - self->fLastPowerWork >= 2000 &&
+		    rdn_fence_done(&self->fAccel, self->fAccel.fence_emitted))
+			self->applyGovernorPower(&self->fIdlePower);
+	}
+	if (self->fEngineUp && !self->fRetiring && !self->fSurfaceGpuStalled && self->fHangMs)
+		self->checkGpuHang();
+	IOLockUnlock(self->fLock);
+	sender->setTimeoutMS(250);
+}
+
+/*
+ * Called with fLock held from the power timer. A hang is a pending fence with
+ * no movement of the completed fence or the ring's read pointer for fHangMs
+ * while the graphics engine or CP reports work in progress. A long wait
+ * alone is not a hang: progress resets the clock.
+ */
+void RadeonNIAccel::checkGpuHang(void)
+{
+	struct rdn_hang_regs regs;
+	UInt64 now;
+	uint32_t mask;
+
+	if (fAccel.card->family != RDN_FAMILY_CAYMAN || rdn_fence_done(&fAccel, fAccel.fence_emitted)) {
+		fHangSince = 0;
+		return;
+	}
+	now = fAccel.card->os->time_ms(fAccel.card->os->cookie);
+	mask = rdn_cayman_hang_mask(&fAccel, &regs);
+	if (!fHangSince || regs.fence != fHangFence || regs.cp_rptr != fHangRptr) {
+		fHangSince = now;
+		fHangFence = regs.fence;
+		fHangRptr = regs.cp_rptr;
+		return;
+	}
+	if (now - fHangSince < fHangMs)
+		return;
+	if (!(mask & (RDN_HANG_GFX | RDN_HANG_CP))) {
+		fHangSince = now;
+		return;
+	}
+	IOLog("RadeonNI: GPU hang: no progress for %lu ms; fence %lu of %lu, CP rptr 0x%lx wptr 0x%lx, "
+	      "GRBM 0x%08lx SE0 0x%08lx SE1 0x%08lx SRBM 0x%08lx\n",
+	      (unsigned long)(now - fHangSince), (unsigned long)regs.fence,
+	      (unsigned long)fAccel.fence_emitted, (unsigned long)regs.cp_rptr,
+	      (unsigned long)regs.cp_wptr, (unsigned long)regs.grbm_status,
+	      (unsigned long)regs.grbm_se0, (unsigned long)regs.grbm_se1,
+	      (unsigned long)regs.srbm_status);
+	recoverGpu(now - fHangSince);
+}
+
+/*
+ * Soft-reset the graphics engine and restart the CP (rdn_accel_recover).
+ * Work in flight is lost; its fences are completed so that no client stays
+ * blocked. If the ring does not come back, GPU work stays refused as before.
+ */
+void RadeonNIAccel::recoverGpu(UInt64 stalledMs)
+{
+	struct rdn_accel_fw fw;
+	uint32_t before = 0, after = 0;
+	int r;
+
+	fw.pfp = (const uint8_t *)fPfp;
+	fw.pfp_size = fPfpSize;
+	fw.me = (const uint8_t *)fMe;
+	fw.me_size = fMeSize;
+	r = rdn_accel_recover(&fAccel, &fw, &before, &after);
+	fGpuResets++;
+	fHangSince = 0;
+	setProperty("RadeonNIGPUResets", (UInt64)fGpuResets, 32);
+	fFenceEvents++;
+	IOLockWakeup(fLock, &fFenceEvents, false);
+	if (r) {
+		IOLog("RadeonNI: GPU reset %lu failed (%d; busy 0x%lx before, 0x%lx after); GPU work refused\n",
+		      (unsigned long)fGpuResets, r, (unsigned long)before, (unsigned long)after);
+		fSurfaceGpuStalled = true;
+		setProperty("RadeonNIGPURecoveryFailed", kOSBooleanTrue);
+		return;
+	}
+	IOLog("RadeonNI: GPU reset %lu after %lu ms without progress: busy 0x%lx before, 0x%lx after; ring restarted\n",
+	      (unsigned long)fGpuResets, (unsigned long)stalledMs, (unsigned long)before, (unsigned long)after);
+}
+
+void RadeonNIAccel::startIdleGovernor()
+{
+	int keepBoot = 0, enabled = 1;
+	if (fHardwarePower || (fAccel.card && fAccel.card->family == RDN_FAMILY_CAYMAN))
+		return;
+	if (!fEngineUp || fAccel.card->family != RDN_FAMILY_CAYMAN ||
+	    (PE_parse_boot_arg("rdn_bootclocks", &keepBoot) && keepBoot) ||
+	    (PE_parse_boot_arg("rdn_idle", &enabled) && !enabled))
+		return;
+	if (!fFramebuffer->tryPowerLock())
+		return;
+	bool valid = fPowerKnown && fPower.vddc &&
+	    !rdn_pm_display_idle_state(fAccel.card, fPower.mclk, &fIdlePower) &&
+	    !rdn_pm_performance_state(fAccel.card, &fPerformancePower) &&
+	    !rdn_pm_resolve_state(fAccel.card, &fPerformancePower);
+	fFramebuffer->unlockPower();
+	if (!valid)
+		return;
+	/* Keep active-display GDDR5 timing fixed; only core clock and voltage vary. */
+	fIdlePower.mclk = fPerformancePower.mclk = fPower.mclk;
+	fIdlePower.vddci = fPerformancePower.vddci = fPower.vddci;
+	if (fIdlePower.sclk >= fPerformancePower.sclk ||
+	    fIdlePower.vddc > fPerformancePower.vddc)
+		return;
+	fPowerLoop = IOWorkLoop::workLoop();
+	if (!fPowerLoop)
+		return;
+	fPowerTimer = IOTimerEventSource::timerEventSource(this, powerTimerFired);
+	if (!fPowerTimer || fPowerLoop->addEventSource(fPowerTimer) != kIOReturnSuccess) {
+		stopIdleGovernor();
+		return;
+	}
+	fLastPowerWork = fAccel.card->os->time_ms(fAccel.card->os->cookie);
+	fAccel.before_submit = powerBeforeSubmit;
+	fAccel.submit_cookie = this;
+	fIdleGovernor = true;
+	setProperty("IdleGovernor", true);
+	setProperty("IdleCoreClock10KHz", (UInt64)fIdlePower.sclk, 32);
+	setProperty("IdleCoreVoltageMV", (UInt64)fIdlePower.vddc, 32);
+	setProperty("IdleMemoryClockFixed", true);
+	fPowerTimer->setTimeoutMS(250);
+}
+
+void RadeonNIAccel::stopIdleGovernor()
+{
+	/* Drain the workloop before taking fLock or releasing any GPU mappings. */
+	if (fPowerTimer) {
+		fPowerTimer->cancelTimeout();
+		if (fPowerLoop)
+			fPowerLoop->removeEventSource(fPowerTimer);
+		fPowerTimer->cancelTimeout();
+		fPowerTimer->release();
+		fPowerTimer = 0;
+	}
+	if (fPowerLoop) {
+		fPowerLoop->release();
+		fPowerLoop = 0;
+	}
+	if (fLock)
+		IOLockLock(fLock);
+	fIdleGovernor = false;
+	fAccel.before_submit = 0;
+	fAccel.submit_cookie = 0;
+	if (fLock)
+		IOLockUnlock(fLock);
+}
+
 IOReturn RadeonNIAccel::power(UInt32 state, UInt32 what, UInt32 *sclk,
 			      UInt32 *mclk, UInt32 *temperature)
 {
+ if(state==RDN_UC_POWER_START_SMC) {
+  if(!fAccel.card || fAccel.card->family!=RDN_FAMILY_CAYMAN || !startHardwarePower(true))return kIOReturnNotReady;
+  return power(RDN_UC_POWER_QUERY,0,sclk,mclk,temperature);
+ }
 	struct rdn_card *card = fAccel.card;
-	struct rdn_pm_state target;
+	struct rdn_pm_state target = {0};
 	uint32_t s = 0, m = 0;
-	int r = 0, tries;
+	int r = 0, tries = 0;
 
 	if (!fEngineUp || !card)
 		return kIOReturnNotReady;
+	if (state == RDN_UC_POWER_PERFORMANCE && card->family == RDN_FAMILY_CAYMAN &&
+	    fFramebuffer->getProperty("FanControlReady") != kOSBooleanTrue)
+		return kIOReturnNotReady;
 	IOLockLock(fLock);
+	if (!fFramebuffer->tryPowerLock()) {
+		IOLockUnlock(fLock);
+		return kIOReturnBusy;
+	}
+ if (fHardwarePower && fHardwarePower->enabled && state != RDN_UC_POWER_QUERY) {
+  if(fPowerFault && state!=RDN_UC_POWER_UNDERVOLT)r=-5;
+  else if(state==RDN_UC_POWER_UNDERVOLT) {
+   unsigned mv=what?what:fHardwarePower->performance.vddc;
+   uint32_t raw=rdn_rreg(card,0x740);int temp=rdn_pm_temperature(card);
+   OSNumber *limit=OSDynamicCast(OSNumber,getProperty("ThermalLimitC"));
+   unsigned degrees=limit?limit->unsigned32BitValue():RDN_THERMAL_LIMIT_DEFAULT;
+   if(fPowerFault || fVideoBusy || fUvdUp || (what && (((raw>>16)&0x600) || temp>=(int)degrees*1000)))r=-16;
+   else {
+    r=rdn_cayman_dpm_voltage(card,fHardwarePower,mv);
+    if(!r) {
+     bool active=mv!=fHardwarePower->performance.vddc;
+     fHardwarePower->undervolt_deadline=active?card->os->time_ms(card->os->cookie)+30000:0;
+     setProperty("UndervoltActive",active);setProperty("UndervoltRequestedMV",(UInt64)mv,32);
+     r=rdn_cayman_dpm_policy(card,fHardwarePower,fPerformanceMode,fManualPowerCap);
+    }
+    if(r){fManualPowerCap=true;setProperty("ManualPowerCap",true);(void)rdn_cayman_dpm_force_low(card,true);}
+    if(fHardwarePower->voltage_fault){fPowerFault=true;setProperty("HardwarePowerFault",true);}
+   }
+  }
+  else if(state==RDN_UC_POWER_PROFILE) {
+   OSNumber *fanError=OSDynamicCast(OSNumber,getProperty("FanControlError"));
+   if(what>1)r=-22;
+   else if(fanError && fanError->unsigned32BitValue())r=-5;
+   else {
+    unsigned oldLimit=RDN_THERMAL_LIMIT_DEFAULT;OSNumber *limit=OSDynamicCast(OSNumber,getProperty("ThermalLimitC"));
+    if(limit)oldLimit=limit->unsigned32BitValue();
+    bool high=what!=0;
+    r=rdn_cayman_dpm_temperature_limit(card,oldLimit);
+    if(!r)r=rdn_cayman_dpm_policy(card,fHardwarePower,high,false);
+    if(!r) {
+     fPerformanceMode=high;fManualPowerCap=false;
+     setProperty("PerformanceMode",high);setProperty("ManualPowerCap",false);setProperty("FanSafetyCap",false);
+     setProperty("ThermalLimitC",(UInt64)oldLimit,32);
+    } else {
+     int restored=rdn_cayman_dpm_temperature_limit(card,oldLimit);
+     int capped=rdn_cayman_dpm_force_low(card,true);
+     fPerformanceMode=false;fManualPowerCap=true;
+     setProperty("PerformanceMode",false);setProperty("ManualPowerCap",true);
+     if(restored || capped){fPowerFault=true;setProperty("HardwarePowerFault",true);}
+    }
+   }
+  }
+  else if(state==RDN_UC_POWER_THERMAL_LIMIT) {
+   r=(what>=RDN_THERMAL_LIMIT_MIN && what<=RDN_THERMAL_LIMIT_MAX)?rdn_cayman_dpm_temperature_limit(card,what):-22;
+   if(!r){setProperty("ThermalLimitC",(UInt64)what,32);pollHardwarePower();}
+  }
+  else if (state != RDN_UC_POWER_BOOT && state != RDN_UC_POWER_PERFORMANCE) r=-22;
+  else {
+   bool cap=state==RDN_UC_POWER_BOOT;
+   r=rdn_cayman_dpm_policy(card,fHardwarePower,false,cap);
+   if(!r){fManualPowerCap=cap;fPerformanceMode=false;setProperty("PerformanceMode",false);setProperty("ManualPowerCap",cap);}
+  }
+  rdn_pm_get_clocks(card,&s,&m);*sclk=s;*mclk=m;
+  *temperature=(UInt32)(rdn_pm_temperature(card)+RDN_UC_TEMPERATURE_BIAS);
+  fFramebuffer->unlockPower();IOLockUnlock(fLock);
+  return r?kIOReturnIOError:kIOReturnSuccess;
+ }
+
+	if ((fPowerFault && state!=RDN_UC_POWER_QUERY) ||
+     (card->family==RDN_FAMILY_CAYMAN && state==RDN_UC_POWER_PERFORMANCE && (what&RDN_PM_SCLK))) {
+  fFramebuffer->unlockPower();IOLockUnlock(fLock);return kIOReturnNotReady;
+ }
+ if (fHardwarePower && fHardwarePower->touched && state != RDN_UC_POWER_QUERY) {
+		fFramebuffer->unlockPower();IOLockUnlock(fLock);return kIOReturnNotReady;
+	}
+	if (state != RDN_UC_POWER_QUERY && fIdleGovernor) {
+		fIdleGovernor = false;
+		fAccel.before_submit = 0;
+		setProperty("IdleGovernor", false);
+	}
 	if (fVideoBusy && state != RDN_UC_POWER_QUERY) {
+		fFramebuffer->unlockPower();
 		IOLockUnlock(fLock);
 		return kIOReturnBusy;
 	}
@@ -2560,8 +3394,28 @@ IOReturn RadeonNIAccel::power(UInt32 state, UInt32 what, UInt32 *sclk,
 			r = rdn_pm_performance_state(card, &target);
 		else if (state == RDN_UC_POWER_BOOT)
 			r = rdn_pm_boot_state(card, &target);
+  else if(state==RDN_UC_POWER_TUNE) {
+   if(card->os->cfg_read32(card->os->cookie,0)!=0x67581002u || rdn_pm_temperature(card)>=70000 || ((rdn_rreg(card,0x740)>>16)&0x600) || !ensurePowerTimer())r=-22;
+   else r=rdn_pm_tuning_state(card,what>>16,what&65535,&target);
+   what=RDN_PM_SCLK|RDN_PM_MCLK;
+  }
 		else
 			r = -1;
+		if (!r)
+			r = rdn_pm_resolve_state(card, &target);
+  if(!r && state==RDN_UC_POWER_TUNE) {
+   r=rdn_pm_performance_state(card,&fTuneStock);
+   if(!r)r=rdn_pm_resolve_state(card,&fTuneStock);
+  }
+  if(!r) {
+   bool idle=false;
+   for(unsigned i=0;i<500;i++){if(rdn_fence_done(&fAccel,fAccel.fence_emitted)){idle=true;break;}IOSleep(1);}
+   if(!idle)r=-16;
+  }
+  if(!r && state==RDN_UC_POWER_TUNE) {
+   fClockTuning=true;fTuneDeadline=card->os->time_ms(card->os->cookie)+30000;
+   setProperty("ClockTuningActive",true);
+  }
 		for (tries = 0; !r && tries < 500; tries++) {
 			r = rdn_pm_set(card, &fPower, &target, what);
 			if (r != -16)	/* -EBUSY: the GPU is drawing */
@@ -2583,26 +3437,48 @@ IOReturn RadeonNIAccel::power(UInt32 state, UInt32 what, UInt32 *sclk,
 				fPower.sclk = target.sclk;
 			if (what & RDN_PM_MCLK)
 				fPower.mclk = target.mclk;
+   fClockTuning=state==RDN_UC_POWER_TUNE;
+   if(fClockTuning)fTuneDeadline=card->os->time_ms(card->os->cookie)+30000;
+   setProperty("ClockTuningActive",fClockTuning);
+   setProperty("PowerCoreClock10KHz",(UInt64)fPower.sclk,32);
+   setProperty("PowerMemoryClock10KHz",(UInt64)fPower.mclk,32);
+   setProperty("RequestedCoreVoltageMV",(UInt64)fPower.vddc,32);
+   setProperty("RequestedIOVoltageMV",(UInt64)fPower.vddci,32);
 		}
 	}
 	rdn_pm_get_clocks(card, &s, &m);
+ if(r && state==RDN_UC_POWER_TUNE && fClockTuning)fTuneDeadline=0;
+ if(!r && state==RDN_UC_POWER_TUNE &&
+    ((s>target.sclk?s-target.sclk:target.sclk-s)>100 || (m>target.mclk?m-target.mclk:target.mclk-m)>100)) {
+  fTuneDeadline=0;
+  setProperty("ClockTuningRestoreError",(UInt64)5,32);r=-5;
+  rdn_pm_get_clocks(card,&s,&m);
+ }
 	*sclk = s;
 	*mclk = m;
 	*temperature = (UInt32)(rdn_pm_temperature(card) + RDN_UC_TEMPERATURE_BIAS);
+	fFramebuffer->unlockPower();
 	IOLockUnlock(fLock);
 	return r ? kIOReturnIOError : kIOReturnSuccess;
 }
 
 IOReturn RadeonNIAccel::regRead(UInt32 offset, UInt32 *value)
 {
-	struct rdn_card *card = fAccel.card;
-
-	if (!card || (offset & 3) || offset >= RDN_MMIO_SIZE)
-		return kIOReturnBadArgument;
-	IOLockLock(fLock);
-	*value = rdn_rreg(card, offset);
-	IOLockUnlock(fLock);
-	return kIOReturnSuccess;
+ struct rdn_card *card=fAccel.card;
+ if(!card || (offset&3))return kIOReturnBadArgument;
+ if(offset&RDN_UC_REG_PCI_CONFIG) {
+  offset&=~RDN_UC_REG_PCI_CONFIG;
+  if(offset>4092)return kIOReturnBadArgument;
+  if(offset<256)*value=card->os->cfg_read32(card->os->cookie,offset);
+#ifdef RDN_LEOPARD
+  else *value=fFramebuffer->device()->extendedConfigRead32(offset);
+#else
+  else return kIOReturnUnsupported;
+#endif
+  return kIOReturnSuccess;
+ }
+ if(offset>=RDN_MMIO_SIZE)return kIOReturnBadArgument;
+ IOLockLock(fLock);*value=rdn_rreg(card,offset);IOLockUnlock(fLock);return kIOReturnSuccess;
 }
 
 IOReturn RadeonNIAccel::waitForCPU(void)
@@ -2668,10 +3544,12 @@ void RadeonNIAccel::querySurface(UInt32 wid, struct rdn_user_surface_info *info)
 }
 
 bool RadeonNIAccel::setSurfaceRegion(UInt32 wid, const IOAccelDeviceRegion *rgn,
-				     UInt32 rects)
+				     UInt32 rects, UInt32 fbIndex, bool scanout)
 {
 	int slot;
 	UInt32 r;
+	struct rdn_fb fb;
+	if (!fFramebuffer || !fFramebuffer->screenAt(fbIndex, &fb)) return false;
 
 	IOLockLock(fLock);
 	slot = surfaceSlot(wid, true);
@@ -2683,6 +3561,8 @@ bool RadeonNIAccel::setSurfaceRegion(UInt32 wid, const IOAccelDeviceRegion *rgn,
 		}
 		fShapes[slot].used = true;
 		fShapes[slot].wid = wid;
+		fShapes[slot].fbIndex = fbIndex;
+		fShapes[slot].scanout = scanout && !fShapes[slot].gl && !fShapes[slot].backingTask;
 		region->count = rects;
 		region->bounds[0] = rgn->bounds.x;
 		region->bounds[1] = rgn->bounds.y;
@@ -2697,6 +3577,25 @@ bool RadeonNIAccel::setSurfaceRegion(UInt32 wid, const IOAccelDeviceRegion *rgn,
 	}
 	IOLockUnlock(fLock);
 	return slot >= 0;
+}
+
+bool RadeonNIAccel::getSurfaceScreen(UInt32 wid, struct rdn_user_screen *screen)
+{
+	bool found = false;
+	IOLockLock(fLock);
+	int slot = surfaceSlot(wid, false);
+	struct rdn_fb fb;
+	if (slot >= 0 && fShapes[slot].used && fFramebuffer &&
+	    fFramebuffer->screenAt(fShapes[slot].fbIndex, &fb)) {
+		screen->index = fShapes[slot].fbIndex;
+		screen->scanout = fShapes[slot].scanout && !fShapes[slot].gl && !fShapes[slot].backingTask;
+		screen->offset = fb.aperture_offset;
+		screen->width = fb.width; screen->height = fb.height;
+		screen->pitch_pixels = fb.pitch_pixels; screen->bits_per_pixel = fb.bpp;
+		found = true;
+	}
+	IOLockUnlock(fLock);
+	return found;
 }
 
 bool RadeonNIAccel::getSurfaceRegion(UInt32 wid, struct rdn_user_region *region)
@@ -2716,7 +3615,7 @@ bool RadeonNIAccel::getSurfaceRegion(UInt32 wid, struct rdn_user_region *region)
 }
 
 bool RadeonNIAccel::setSurfaceBuffer(UInt32 wid, UInt32 offset, UInt32 rowBytes,
-				     UInt32 width, UInt32 height, void *owner)
+				     UInt32 width, UInt32 height, void *owner, task_t producerTask)
 {
 	int slot;
 
@@ -2737,6 +3636,7 @@ bool RadeonNIAccel::setSurfaceBuffer(UInt32 wid, UInt32 offset, UInt32 rowBytes,
 		fShapes[slot].bufRowBytes = rowBytes;
 		fShapes[slot].bufWidth = width;
 		fShapes[slot].bufHeight = height;
+        if (width) fShapes[slot].producerTask = producerTask;
 	}
 	IOLockUnlock(fLock);
 	return slot >= 0;
@@ -2837,24 +3737,24 @@ void RadeonNIAccel::listSurfaces(struct rdn_user_surfaces *list)
  * window server does draw the window itself (it moves, something
  * translucent lies over it) it takes the picture from the same buffer.
  *
- * Not waited for: the copy is queued behind whatever the GPU still has to
- * do. Only the copy before it must be done, because both are written to
- * the same place.
+ * Copies share the ordered GPU ring. Each work-area slot stays fenced
+ * until its copy completes; waiting for a slot releases the device lock.
  */
 IOReturn RadeonNIAccel::flushSurface(UInt32 wid)
 {
 	struct rdn_selftest_target screen;
 	struct rdn_draw_surface dst, src;
 	struct rdn_user_region *region = 0;
-	UInt32 width = 0, height = 0, n = 0, waited, r;
+	UInt32 width = 0, height = 0, n = 0, slot = 0, r;
 	uint32_t seq = 0;
 	int i, ret;
 
-	if (!fEngineUp || !fFramebuffer ||
-	    !fFramebuffer->selftestTarget(&fAccel, &screen))
-		return kIOReturnSuccess;
 	bzero(&src, sizeof(src));
 	IOLockLock(fLock);
+	int shape = surfaceSlot(wid, false);
+	if (shape < 0) { IOLockUnlock(fLock); return kIOReturnNotFound; }
+	ret = screenBegin(&screen, &slot, fShapes[shape].fbIndex);
+	if (ret != kIOReturnSuccess) { IOLockUnlock(fLock); return ret; }
 	for (i = 0; i < fShapeCapacity; i++) {
 		if (!fShapes[i].used || fShapes[i].wid != wid ||
 		    !fShapes[i].bufWidth)
@@ -2905,26 +3805,13 @@ IOReturn RadeonNIAccel::flushSurface(UInt32 wid)
 		IOLockUnlock(fLock);
 		return kIOReturnSuccess;
 	}
-	for (waited = 0; fBlitPending && waited < 500; waited++) {
-		if (rdn_fence_done(&fAccel, fBlitFence))
-			fBlitPending = false;
-		else
-			IOSleep(1);
-	}
-	if (fBlitPending) {
-		/* The GPU is stuck or far behind; this picture is skipped. */
-		IOLockUnlock(fLock);
-		return kIOReturnBusy;
-	}
 	dst.gpu_addr = screen.gpu_addr;
 	dst.width = screen.width;
 	dst.height = screen.height;
 	dst.pitch_pixels = screen.pitch_pixels;
-	ret = rdn_blit(&fAccel, &dst, &src, fBlitRects, n, BLIT_OFFSET, &seq);
-	if (!ret) {
-		fBlitFence = seq;
-		fBlitPending = true;
-	}
+	ret = rdn_blit(&fAccel, &dst, &src, fBlitRects, n,
+	               SCREEN_OFFSET + slot * SCREEN_SLOT_BYTES, &seq);
+	screenEnd(slot);
 	IOLockUnlock(fLock);
 	return ret ? kIOReturnIOError : kIOReturnSuccess;
 }
@@ -2935,7 +3822,7 @@ void RadeonNIAccel::forgetSurface(UInt32 wid)
 
 	IOLockLock(fLock);
 	for (i = 0; i < fShapeCapacity; i++)
-		if (fShapes[i].used && fShapes[i].wid == wid)
+		if (fShapes[i].used && fShapes[i].wid == wid && !fShapes[i].backingClient)
 			bzero(&fShapes[i], sizeof(fShapes[i]));
 	IOLockUnlock(fLock);
 }
@@ -2983,9 +3870,10 @@ static bool screenClip(const struct rdn_selftest_target *screen, SInt32 *x,
  * the screen has 32 bits a pixel.
  */
 IOReturn RadeonNIAccel::screenBegin(struct rdn_selftest_target *screen,
-				    UInt32 *slot)
+				    UInt32 *slot, UInt32 fbIndex)
 {
-	UInt32 waited = 0, s;
+	UInt32 s;
+	UInt64 end = fAccel.card->os->time_ms(fAccel.card->os->cookie) + 500;
 
 	if (rdn_blit_move_work_bytes() > SCREEN_SLOT_BYTES)
 		return kIOReturnUnsupported;
@@ -3000,14 +3888,22 @@ IOReturn RadeonNIAccel::screenBegin(struct rdn_selftest_target *screen,
 		if (!fScreenSlot[s].pending)
 			break;
 		/* The GPU is stuck or far behind. */
-		if (waited++ >= 500)
-			return kIOReturnBusy;
+		UInt64 now = fAccel.card->os->time_ms(fAccel.card->os->cookie);
+		if (now >= end) return kIOReturnBusy;
+		UInt32 pending = fScreenSlot[s].fence;
 		IOLockUnlock(fLock);
-		IOSleep(1);
+		bool done = fenceWait(pending, (UInt32)(end - now));
 		IOLockLock(fLock);
+		if (!done) return kIOReturnBusy;
 	}
-	if (!fFramebuffer->selftestTarget(&fAccel, screen))
+	struct rdn_fb fb;
+	if (!fFramebuffer->screenAt(fbIndex, &fb) || fb.bpp != 32)
 		return kIOReturnUnsupported;
+	bzero(screen, sizeof(*screen));
+	screen->gpu_addr = rdn_vram_addr(&fAccel, fb.aperture_offset);
+	screen->width = fb.width; screen->height = fb.height;
+	screen->pitch_pixels = fb.pitch_pixels;
+	screen->big_endian_pixels = fb.big_endian_pixels;
 	*slot = s;
 	return kIOReturnSuccess;
 }
@@ -3208,10 +4104,32 @@ bool RadeonNIUserClient::initWithTask(task_t owningTask, void *securityID,
 	if (!super::initWithTask(owningTask, securityID, type))
 		return false;
 	fTask = owningTask;
+#ifdef RDN_SLEEP_INDEX_PROBE
+	fMappingProbeMemory = 0;fMappingProbeUniqueMap=0;fMappingProbeMode=0;
+	bzero(&fPhysicalProbe,sizeof(fPhysicalProbe));
+#endif
+    fSurfaceGpuFailed = false;
 	fProtocolV2 = type == RDN_UC_TYPE_V2;
 	fUvdAdministrator = clientHasPrivilege(securityID,
 		kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
-	fOffsets = (UInt32 *)IOMalloc(kMaxAllocations * sizeof(UInt32));
+    fWindowServerClient = false;
+    fSurfaceCompositor = fUvdAdministrator;
+#ifdef RDN_LEOPARD
+    char processName[32];
+    bzero(processName, sizeof(processName));
+    proc_selfname(processName, sizeof(processName));
+    fWindowServerClient = !strcmp(processName, "WindowServer");
+    fSurfaceCompositor = fUvdAdministrator ||
+        (kauth_cred_getuid(kauth_cred_get()) == 88 && fWindowServerClient);
+#endif
+	fAllocationLock = IOLockAlloc();
+    fOffsets = (UInt32 *)IOMalloc(kMaxAllocations * sizeof(UInt32));
+    if (!fAllocationLock || !fOffsets) {
+        if (fAllocationLock) IOLockFree(fAllocationLock);
+        if (fOffsets) IOFree(fOffsets, kMaxAllocations * sizeof(UInt32));
+        fAllocationLock = 0; fOffsets = 0;
+        return false;
+    }
 	fCount = 0;
 	fUvdUser = false;
 	fUvdHandleCount = 0;
@@ -3230,8 +4148,15 @@ void RadeonNIUserClient::freeAll(void)
 {
 	if (!fAccel || !fOffsets)
 		return;
+    IOLockLock(fAllocationLock);
+#ifdef RDN_SLEEP_INDEX_PROBE
+    if(fMappingProbeMode==3 && rdn_physical_probe_finish(&fPhysicalProbe))fAccel->mappingProbePoison();
+    if(fMappingProbeUniqueMap){fMappingProbeUniqueMap->unmap();fMappingProbeUniqueMap->release();fMappingProbeUniqueMap=0;}
+    if(fMappingProbeMemory){fMappingProbeMemory->release();fMappingProbeMemory=0;}
+    fMappingProbeMode=0;
+#endif
 	bool uvdSafe = !fUvdUser || fAccel->uvdDestroy(fUvdHandles, fUvdHandleCount, fUvdHandleEpoch);
-	if (uvdSafe)
+	if (uvdSafe && !fSurfaceGpuFailed)
 		fAccel->releaseClientMemory(fOffsets, fCount, this);
 	else
 		fAccel->retainClientMemory(fOffsets, fCount, this);
@@ -3241,6 +4166,7 @@ void RadeonNIUserClient::freeAll(void)
 		fUvdUser = false;
 		fAccel->uvdUser(false);
 	}
+    IOLockUnlock(fAllocationLock);
 }
 
 IOReturn RadeonNIUserClient::clientClose(void)
@@ -3262,6 +4188,7 @@ void RadeonNIUserClient::stop(IOService *provider)
 		IOFree(fOffsets, kMaxAllocations * sizeof(UInt32));
 		fOffsets = 0;
 	}
+    if (fAllocationLock) { IOLockFree(fAllocationLock); fAllocationLock = 0; }
 	super::stop(provider);
 }
 
@@ -3347,6 +4274,30 @@ IOExternalMethod *RadeonNIUserClient::getTargetAndMethodForIndex(
 		  kIOUCScalarIStructO, 1, sizeof(struct rdn_user_uvd_fixture) },
 		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdFixtureRead,
 		  kIOUCScalarIStructO, 2, RDN_UVD_FIXTURE_CHUNK_BYTES },
+        { 0, (IOMethod)&RadeonNIUserClient::methodSurfaceGpuInfo,
+          kIOUCScalarIStructO, 1, sizeof(struct rdn_user_surface_info) },
+        { 0, (IOMethod)&RadeonNIUserClient::methodSurfaceGpuCopy,
+          kIOUCScalarIScalarO, 5, 0 },
+        { 0, (IOMethod)&RadeonNIUserClient::methodFenceControl,
+          kIOUCScalarIScalarO, 1, 3 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodSurfaceScreen,
+		  kIOUCScalarIStructO, 1, sizeof(struct rdn_user_screen) },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodManagedInfo, kIOUCScalarIScalarO, 0, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodManagedAlias, kIOUCScalarIScalarO, 3, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodManagedEvict, kIOUCScalarIScalarO, 3, 0 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodManagedPromote, kIOUCScalarIScalarO, 2, 0 },
+        { 0, (IOMethod)&RadeonNIUserClient::methodCommandInfo, kIOUCScalarIScalarO, 0, 1 },
+        { 0, (IOMethod)&RadeonNIUserClient::methodAllocCommand, kIOUCScalarIScalarO, 2, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodMemoryUsage, kIOUCScalarIStructO, 0, sizeof(struct rdn_user_memory_usage) },
+        {0,(IOMethod)&RadeonNIUserClient::methodSleepRehearsal,kIOUCScalarIStructO,2,sizeof(struct rdn_user_sleep_rehearsal)},
+        {0,(IOMethod)&RadeonNIUserClient::methodSleepMaintenance,kIOUCScalarIStructO,2,sizeof(struct rdn_user_sleep_maintenance)},
+        {0,(IOMethod)&RadeonNIUserClient::methodSleepResource,kIOUCScalarIStructO,4,sizeof(struct rdn_user_sleep_resource)},
+        {0,(IOMethod)&RadeonNIUserClient::methodSleepIndexHidden,kIOUCScalarIStructO,1,16},
+        {0,(IOMethod)&RadeonNIUserClient::methodSleepIndexRestore,kIOUCScalarIScalarO,5,0},
+        {0,(IOMethod)&RadeonNIUserClient::methodSleepLivePlan,kIOUCScalarIStructO,0,sizeof(struct rdn_user_live_plan)},
+        {0,(IOMethod)&RadeonNIUserClient::methodSleepMappingProbe,kIOUCScalarIScalarO,1,1},
+        {0,(IOMethod)&RadeonNIUserClient::methodSleepMappingUniqueProbe,kIOUCScalarIScalarO,1,1},
+        {0,(IOMethod)&RadeonNIUserClient::methodSleepMappingPhysicalProbe,kIOUCScalarIScalarO,1,1},
 	};
 
 	if (index >= (fProtocolV2 ? RDN_UC_METHOD_COUNT : RDN_UC_V1_METHOD_COUNT))
@@ -3361,6 +4312,31 @@ IOReturn RadeonNIUserClient::clientMemoryForType(UInt32 type,
 {
 	IOMemoryDescriptor *aperture;
 
+#ifdef RDN_SLEEP_INDEX_PROBE
+	if(type==RDN_UC_MEMORY_GATE_PROBE || type==RDN_UC_MEMORY_UNIQUE_PROBE) {
+		if(!options||!memory)return kIOReturnBadArgument;
+		if(!fAccel || !fProtocolV2 || !fUvdAdministrator || fWindowServerClient || !fAllocationLock)
+			return kIOReturnNotPrivileged;
+		if(!fAccel->mappingProbeAllowed())return kIOReturnUnsupported;
+		IOLockLock(fAllocationLock);
+		UInt32 mode=type==RDN_UC_MEMORY_UNIQUE_PROBE?2u:1u;
+		if(fMappingProbeMode && fMappingProbeMode!=mode){IOLockUnlock(fAllocationLock);return kIOReturnBusy;}
+		if(!fMappingProbeMemory) {
+			fMappingProbeMemory=IOBufferMemoryDescriptor::withOptions(
+				kIODirectionInOut|kIOMemoryKernelUserShared,4096,4096);
+			if(fMappingProbeMemory && fMappingProbeMemory->getBytesNoCopy())
+				*(volatile UInt32 *)fMappingProbeMemory->getBytesNoCopy()=0x73ac19e5u;
+		}
+		if(!fMappingProbeMemory || !fMappingProbeMemory->getBytesNoCopy()) {
+			if(fMappingProbeMemory){fMappingProbeMemory->release();fMappingProbeMemory=0;}
+			IOLockUnlock(fAllocationLock);return kIOReturnNoMemory;
+		}
+		fMappingProbeMode=mode;
+		fMappingProbeMemory->retain();*memory=fMappingProbeMemory;*options=0;
+		IOLockUnlock(fAllocationLock);return kIOReturnSuccess;
+	}
+#endif
+
 	if (type != RDN_UC_MEMORY_APERTURE || !fAccel)
 		return kIOReturnBadArgument;
 	aperture = fAccel->apertureMemory();
@@ -3371,6 +4347,47 @@ IOReturn RadeonNIUserClient::clientMemoryForType(UInt32 type,
 	*memory = aperture;
 	return kIOReturnSuccess;
 }
+
+#ifdef RDN_SLEEP_INDEX_PROBE
+/* Only the isolated RAM diagnostic uses a unique mapping; ordinary aperture
+ * mapping remains with IOUserClient. The extra reference is released at
+ * client close; this is not a live framebuffer mapping registry. */
+IOMemoryMap *RadeonNIUserClient::mapClientMemory(IOOptionBits type,task_t task,
+                                                IOOptionBits mapFlags,IOVirtualAddress atAddress)
+{
+    if(type==RDN_UC_MEMORY_PHYSICAL_PROBE) {
+        if(!fAccel||!fProtocolV2||!fUvdAdministrator||fWindowServerClient||!fAllocationLock||task!=fTask||
+           !fAccel->mappingProbeAllowed()||mapFlags!=kIOMapAnywhere||atAddress)return 0;
+        IOLockLock(fAllocationLock);
+        if(fMappingProbeMode||rdn_physical_probe_prepare(&fPhysicalProbe)) {
+            if(fPhysicalProbe.uncertain)fAccel->mappingProbePoison();
+            IOLockUnlock(fAllocationLock);return 0;
+        }
+        fMappingProbeMode=3;
+        IOMemoryMap *m=rdn_physical_probe_map(&fPhysicalProbe,task,mapFlags,atAddress);
+        if(!m && rdn_physical_probe_finish(&fPhysicalProbe))fAccel->mappingProbePoison();
+        IOLockUnlock(fAllocationLock);return m;
+    }
+    if(type!=RDN_UC_MEMORY_UNIQUE_PROBE)return super::mapClientMemory(type,task,mapFlags,atAddress);
+    if(!fAccel||!fProtocolV2||!fUvdAdministrator||fWindowServerClient||!fAllocationLock||task!=fTask||
+       !fAccel->mappingProbeAllowed())return 0;
+    IOLockLock(fAllocationLock);
+    if(fMappingProbeUniqueMap || (fMappingProbeMode&&fMappingProbeMode!=2)) {IOLockUnlock(fAllocationLock);return 0;}
+    if(!fMappingProbeMemory) {
+        fMappingProbeMemory=IOBufferMemoryDescriptor::withOptions(kIODirectionInOut|kIOMemoryKernelUserShared,4096,4096);
+        if(fMappingProbeMemory&&fMappingProbeMemory->getBytesNoCopy())
+            *(volatile UInt32 *)fMappingProbeMemory->getBytesNoCopy()=0x73ac19e5u;
+    }
+    if(!fMappingProbeMemory||!fMappingProbeMemory->getBytesNoCopy()) {
+        if(fMappingProbeMemory){fMappingProbeMemory->release();fMappingProbeMemory=0;}
+        IOLockUnlock(fAllocationLock);return 0;
+    }
+    fMappingProbeMode=2;
+    IOMemoryMap *mapping=fMappingProbeMemory->map(task,atAddress,(mapFlags&kIOMapUserOptionsMask)|kIOMapUnique);
+    if(mapping){mapping->retain();fMappingProbeUniqueMap=mapping;}
+    IOLockUnlock(fAllocationLock);return mapping;
+}
+#endif
 
 IOReturn RadeonNIUserClient::methodGetInfo(struct rdn_user_info *info,
 					   IOByteCount *size)
@@ -3411,43 +4428,27 @@ IOReturn RadeonNIUserClient::methodSurfaceQuery(UInt32 wid,
 	return kIOReturnSuccess;
 }
 
-IOReturn RadeonNIUserClient::methodAlloc(UInt32 size, UInt32 align,
-					 UInt32 *offset)
+IOReturn RadeonNIUserClient::allocateMemory(UInt32 size, UInt32 align, UInt32 *offset,
+    bool hidden, bool segment, bool command)
 {
-	IOReturn r;
-
-	if (fCount >= kMaxAllocations)
-		return kIOReturnNoResources;
-	r = fAccel->allocVram(size, align, offset);
-	if (r == kIOReturnSuccess)
-		fOffsets[fCount++] = *offset;
-	return r;
+    IOLockLock(fAllocationLock);
+    IOReturn result = kIOReturnNoResources;
+    if (fCount < kMaxAllocations && !fSurfaceGpuFailed) {
+        result = fAccel->allocVram(size, align, offset, hidden, segment, command);
+        if (result == kIOReturnSuccess) fOffsets[fCount++] = *offset;
+    }
+    IOLockUnlock(fAllocationLock);
+    return result;
 }
 
-IOReturn RadeonNIUserClient::methodAllocHidden(UInt32 size, UInt32 align,
-					       UInt32 *offset)
-{
-	IOReturn r;
+IOReturn RadeonNIUserClient::methodAlloc(UInt32 size, UInt32 align, UInt32 *offset)
+{ return allocateMemory(size, align, offset, false, false); }
 
-	if (fCount >= kMaxAllocations)
-		return kIOReturnNoResources;
-	r = fAccel->allocVram(size, align, offset, true);
-	if (r == kIOReturnSuccess)
-		fOffsets[fCount++] = *offset;
-	return r;
-}
+IOReturn RadeonNIUserClient::methodAllocHidden(UInt32 size, UInt32 align, UInt32 *offset)
+{ return allocateMemory(size, align, offset, true, false); }
 
 IOReturn RadeonNIUserClient::methodAllocUvd(UInt32 size, UInt32 align, UInt32 *offset)
-{
-	IOReturn r;
-
-	if (fCount >= kMaxAllocations)
-		return kIOReturnNoResources;
-	r = fAccel->allocVram(size, align, offset, false, true);
-	if (r == kIOReturnSuccess)
-		fOffsets[fCount++] = *offset;
-	return r;
-}
+{ return allocateMemory(size, align, offset, false, true); }
 
 IOReturn RadeonNIUserClient::methodUvdSegment(UInt32 *mode, UInt32 *first, UInt32 *size)
 {
@@ -3533,23 +4534,32 @@ IOReturn RadeonNIUserClient::methodScreenCopy(UInt32 sx, UInt32 sy, UInt32 dx,
 
 IOReturn RadeonNIUserClient::methodFree(UInt32 offset)
 {
-	UInt32 i;
-
-	/* Only what this client allocated. */
-	for (i = 0; i < fCount; i++)
-		if (fOffsets[i] == offset) {
-			fOffsets[i] = fOffsets[--fCount];
-			fAccel->freeVram(offset);
-			return kIOReturnSuccess;
-		}
-	return kIOReturnBadArgument;
+    IOLockLock(fAllocationLock);
+    IOReturn result = fSurfaceGpuFailed ? kIOReturnNotReady : kIOReturnBadArgument;
+    for (UInt32 i = 0; !fSurfaceGpuFailed && i < fCount; ++i) {
+        if (fOffsets[i] != offset) continue;
+        fOffsets[i] = fOffsets[--fCount];
+        fAccel->freeVram(offset);
+        result = kIOReturnSuccess;
+        break;
+    }
+    IOLockUnlock(fAllocationLock);
+    return result;
 }
 
 IOReturn RadeonNIUserClient::methodSubmit(UInt32 offset, UInt32 words,
 					  UInt32 *fence)
 {
 	fAccel->ibRecord('3', this, offset, words);
-	return fAccel->submit(offset, words, fence);
+	IOReturn result = fAccel->submit(offset, words, fence);
+    if (result == kIOReturnSuccess) {
+        IOReturn mirror = fAccel->refreshSurfaceGpuOwner(this, fence);
+        if (mirror != kIOReturnSuccess) {
+            static UInt32 reports;
+            if (reports++ < 16) IOLog("RadeonNI: submitted fence %lu; mirror refresh failed 0x%lx\n", *fence, mirror);
+        }
+    }
+    return result;
 }
 
 IOReturn RadeonNIUserClient::methodFenceWait(UInt32 fence, UInt32 timeoutMs,
@@ -3666,8 +4676,33 @@ IOReturn RadeonNIUserClient::methodSurfaceBuffer(UInt32 wid, UInt32 offset,
 	if (width && ((UInt64)offset + (UInt64)rowBytes * height >
 		      fAccel->apertureBytes() || rowBytes < width * 4))
 		return kIOReturnBadArgument;
-	return fAccel->setSurfaceBuffer(wid, offset, rowBytes, width, height, this)
-		? kIOReturnSuccess : kIOReturnNoResources;
+    IOLockLock(fAllocationLock);
+    bool owned = !width;
+    for (UInt32 i = 0; i < fCount; ++i) if (fOffsets[i] == offset) owned = true;
+    UInt32 oldOffset, oldStride, oldWidth, oldHeight;
+    bool changed = width && (!fAccel->getSurfaceBuffer(wid, &oldOffset, &oldStride, &oldWidth, &oldHeight) ||
+        offset != oldOffset || rowBytes != oldStride || width != oldWidth || height != oldHeight);
+    IOReturn result = kIOReturnBadArgument;
+    if (owned && (!width || fAccel->surfaceDestination(offset, rowBytes, width, height))) {
+        result = fAccel->setSurfaceBuffer(wid, offset, rowBytes, width, height, this, fTask)
+            ? kIOReturnSuccess : kIOReturnNoResources;
+        if (result == kIOReturnSuccess && changed) {
+            IOReturn initialized = fAccel->initializeSurfaceGpu(wid, fTask);
+            if (initialized != kIOReturnNotFound) result = initialized;
+            if (result == kIOReturnTimeout) fSurfaceGpuFailed = true;
+        }
+    }
+    IOLockUnlock(fAllocationLock);
+    return result;
+}
+
+IOReturn RadeonNIUserClient::methodSurfaceScreen(UInt32 wid,
+	struct rdn_user_screen *screen, IOByteCount *size)
+{
+	if (!screen || !size || *size < sizeof(*screen)) return kIOReturnBadArgument;
+	if (!fAccel->getSurfaceScreen(wid, screen)) return kIOReturnNotFound;
+	*size = sizeof(*screen);
+	return kIOReturnSuccess;
 }
 
 IOReturn RadeonNIUserClient::methodSurfaceRegion(UInt32 wid,
@@ -3688,4 +4723,810 @@ IOReturn RadeonNIUserClient::methodSurfaceBacking(UInt32 wid,
 	if (!fAccel->getSurfaceBacking(wid, fTask, backing)) return kIOReturnNotFound;
 	*size = sizeof(*backing);
 	return kIOReturnSuccess;
+}
+
+void RadeonNIAccel::setSurfaceBackingOwner(UInt32 wid, RadeonNISurfaceClient *owner)
+{
+    IOLockLock(fLock);
+    int slot = surfaceSlot(wid, false);
+    if (slot >= 0) fShapes[slot].backingClient = owner;
+    IOLockUnlock(fLock);
+}
+
+void RadeonNIAccel::clearSurfaceBackingOwner(UInt32 wid, RadeonNISurfaceClient *owner)
+{
+    IOLockLock(fLock);
+    int slot = surfaceSlot(wid, false);
+    if (slot >= 0 && fShapes[slot].backingClient == owner) {
+        for (UInt32 i = 0; i < kSurfaceMirrors; ++i)
+            if (fSurfaceMirrors[i].surface == wid) fSurfaceMirrors[i].surface = 0;
+        fShapes[slot].backingClient = 0;
+        fShapes[slot].backingTask = 0;
+        bzero(&fShapes[slot].backing, sizeof(fShapes[slot].backing));
+    }
+    IOLockUnlock(fLock);
+}
+
+RadeonNISurfaceClient *RadeonNIAccel::retainSurfaceBacking(UInt32 wid, task_t task, bool administrator)
+{
+    RadeonNISurfaceClient *client = 0;
+    IOLockLock(fLock);
+    int slot = surfaceSlot(wid, false);
+    if (slot >= 0 && (administrator || fShapes[slot].backingTask == task ||
+        (task && fShapes[slot].producerTask == task))) {
+        client = fShapes[slot].backingClient;
+        if (client) client->retain();
+    }
+    IOLockUnlock(fLock);
+    return client;
+}
+
+IOReturn RadeonNIAccel::initializeSurfaceGpu(UInt32 wid, task_t task)
+{
+    RadeonNISurfaceClient *client = retainSurfaceBacking(wid, task, false);
+    if (!client) return kIOReturnNotFound;
+    IOReturn result = client->initializeGpu();
+    client->release();
+    return result;
+}
+
+IOReturn RadeonNIAccel::surfaceGpuInfo(UInt32 wid, task_t task, bool administrator,
+    struct rdn_user_surface_info *info)
+{
+    RadeonNISurfaceClient *client = retainSurfaceBacking(wid, task, administrator);
+    if (!client) return kIOReturnNotFound;
+    IOReturn result = client->gpuInfo(info);
+    client->release();
+    return result;
+}
+
+bool RadeonNIAccel::surfaceDestination(UInt32 offset, UInt32 stride, UInt32 width, UInt32 height)
+{
+    if (!width || !height || width > 16384 || height > 16384 ||
+        stride < width * 4 || (stride & 3)) return false;
+    UInt64 bytes = (UInt64)stride * (height - 1) + width * 4;
+    IOLockLock(fLock);
+    bool valid = bytes <= rdn_mem_allocation_size(&fMem, offset) &&
+        (UInt64)offset + bytes <= fAccel.aperture_size;
+    IOLockUnlock(fLock);
+    return valid;
+}
+
+IOReturn RadeonNIAccel::surfaceGpuCopy(UInt32 wid, task_t task, bool administrator,
+    UInt32 offset, UInt32 stride, UInt32 width, UInt32 height)
+{
+    RadeonNISurfaceClient *client = retainSurfaceBacking(wid, task, administrator);
+    if (!client) return kIOReturnNotFound;
+    IOReturn result = client->gpuCopy(offset, stride, width, height);
+    client->release();
+    IOLockLock(fLock);
+    if (result == kIOReturnSuccess) {
+        ++fSurfaceGpuCopies;
+        fSurfaceGpuBytes += (UInt64)width * height * 4;
+        if (!(fSurfaceGpuCopies & (fSurfaceGpuCopies - 1)) || !(fSurfaceGpuCopies & 255)) {
+            setProperty("RadeonNISurfaceGPUCopies", fSurfaceGpuCopies, 64);
+            setProperty("RadeonNISurfaceGPUBytes", fSurfaceGpuBytes, 64);
+        }
+    }
+    IOLockUnlock(fLock);
+    return result;
+}
+
+IOReturn RadeonNIAccel::surfaceGpuTransfer(UInt64 source, UInt32 sourceStride,
+    UInt64 destination, UInt32 destinationStride, UInt32 width, UInt32 height, UInt32 surface, bool locked, bool wait)
+{
+    if (!width || !height || height > 16384) return kIOReturnBadArgument;
+    UInt32 capacity = (height * 6 + 12) * 4;
+    uint32_t words = 0, seq = 0;
+    UInt32 *commands = (UInt32 *)IOMalloc(capacity);
+    if (!commands) return kIOReturnNoMemory;
+    if (!locked) IOLockLock(fLock);
+    if (fRetiring || fSurfaceGpuStalled
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+        || fQuiesce.internal_hold
+#endif
+       ) {
+        if (!locked) IOLockUnlock(fLock); IOFree(commands, capacity); return kIOReturnNotReady;
+    }
+    int mirror = -1;
+    if (surface) {
+        for (UInt32 i = 0; i < kSurfaceMirrors; ++i) {
+            if (fSurfaceMirrors[i].surface == surface &&
+                surfaceVramAddress(fSurfaceMirrors[i].offset) == destination) { mirror = i; break; }
+            if (!fSurfaceMirrors[i].surface && mirror < 0) mirror = i;
+        }
+        if (mirror < 0) {
+            if (!locked) IOLockUnlock(fLock);
+            IOFree(commands, capacity); return kIOReturnNoResources;
+        }
+    }
+    int slot = surface ? surfaceSlot(surface, false) : -1;
+    if (slot >= 0 && fShapes[slot].bufWidth == width && fShapes[slot].bufHeight == height) {
+        source = rdn_vram_addr(&fAccel, fShapes[slot].bufOffset);
+        sourceStride = fShapes[slot].bufRowBytes;
+    }
+    if (source == destination && sourceStride == destinationStride) {
+        if (!wait) {
+            if (!locked) IOLockUnlock(fLock);
+            IOFree(commands, capacity); return kIOReturnSuccess;
+        }
+        int error = rdn_fence_wait(&fAccel, fAccel.fence_emitted, 500);
+        if (error) {
+            fSurfaceGpuStalled = true;
+            setProperty("RadeonNISurfaceGPURebootRequired", kOSBooleanTrue);
+        }
+        if (!locked) IOLockUnlock(fLock); IOFree(commands, capacity);
+        return error ? kIOReturnTimeout : kIOReturnSuccess;
+    }
+    int error = rdn_cp_dma_surface_build(source, sourceStride, destination,
+        destinationStride, width, height, commands, capacity, &words);
+    UInt64 offset = 0;
+    RetiredVram *retired = wait ? 0 : (RetiredVram *)IOMalloc(sizeof(RetiredVram));
+    struct rdn_mem *heap = wait ? &fMem : &fCommandMem;
+    reapRetiredVram();
+    if (error || (!wait && !retired) || rdn_mem_alloc(heap, words * 4, 4096, &offset)) {
+        if (retired) IOFree(retired, sizeof(*retired));
+        if (!locked) IOLockUnlock(fLock); IOFree(commands, capacity);
+        return error ? kIOReturnBadArgument : kIOReturnNoResources;
+    }
+    volatile UInt32 *ib = (volatile UInt32 *)((UInt8 *)fAccel.aperture + offset);
+    for (UInt32 i = 0; i < words; ++i) ib[i] = commands[i];
+    rdnStoreBarrier();
+    if (!wait) {
+        // Queue the copy and fence together, without waiting for GPU completion.
+        error = rdn_ib_submit(&fAccel, rdn_vram_addr(&fAccel, offset), words, &seq);
+        if (!error) {
+            retired->offset = (UInt32)offset; retired->fence = seq;
+            retired->next = fRetiredVram; fRetiredVram = retired;
+        } else {
+            rdn_mem_free(heap, offset);
+            IOFree(retired, sizeof(*retired));
+        }
+        if (!locked) IOLockUnlock(fLock);
+        IOFree(commands, capacity);
+        return error ? kIOReturnBusy : kIOReturnSuccess;
+    }
+    error = rdn_ib_submit(&fAccel, rdn_vram_addr(&fAccel, offset), words, &seq);
+    if (!error) error = rdn_fence_wait(&fAccel, seq, 500);
+    if (!error) {
+        rdn_mem_free(&fMem, offset);
+        if (mirror >= 0) {
+            SurfaceMirror *m = &fSurfaceMirrors[mirror];
+            m->surface = surface; m->offset = (UInt32)(destination - rdn_vram_addr(&fAccel, 0));
+            m->stride = destinationStride; m->width = width; m->height = height;
+        }
+    }
+    else {
+        fSurfaceGpuStalled = true;
+        setProperty("RadeonNISurfaceGPURebootRequired", kOSBooleanTrue);
+    }
+    if (!locked) IOLockUnlock(fLock);
+    IOFree(commands, capacity);
+    return error ? kIOReturnTimeout : kIOReturnSuccess;
+}
+
+IOReturn RadeonNIAccel::syncSurfaceGpu(UInt32 surface, UInt64 ram, UInt32 stride,
+    UInt32 width, UInt32 height, bool toCPU)
+{
+    IOLockLock(fLock);
+    IOReturn result = kIOReturnSuccess;
+    int slot = surfaceSlot(surface, false);
+    if (slot >= 0) {
+        SurfaceRecord *s = &fShapes[slot];
+        if (s->bufWidth == width && s->bufHeight == height) {
+            UInt64 bytes = (UInt64)s->bufRowBytes * (height - 1) + width * 4;
+            if (s->bufRowBytes < width * 4 || s->bufOffset + bytes > fAccel.aperture_size)
+                result = kIOReturnBadArgument;
+            else {
+                UInt64 gpu = surfaceVramAddress(s->bufOffset);
+                result = surfaceGpuTransfer(toCPU ? gpu : ram, toCPU ? s->bufRowBytes : stride,
+                    toCPU ? ram : gpu, toCPU ? stride : s->bufRowBytes, width, height, 0, true);
+            }
+        }
+    }
+    if (!toCPU) for (UInt32 i = 0; i < kSurfaceMirrors && result == kIOReturnSuccess; ++i) {
+        SurfaceMirror *m = &fSurfaceMirrors[i];
+        if (m->surface == surface && m->width == width && m->height == height)
+            result = surfaceGpuTransfer(ram, stride, surfaceVramAddress(m->offset),
+                m->stride, width, height, 0, true);
+    }
+    IOLockUnlock(fLock);
+    return result;
+}
+
+IOReturn RadeonNIAccel::refreshSurfaceGpuOwner(void *owner, UInt32 *fence)
+{
+    IOLockLock(fLock);
+    IOReturn result = kIOReturnSuccess;
+    for (UInt32 i = 0; i < kSurfaceMirrors && result == kIOReturnSuccess; ++i) {
+        SurfaceMirror *m = &fSurfaceMirrors[i];
+        int slot = m->surface ? surfaceSlot(m->surface, false) : -1;
+        if (slot < 0) continue;
+        SurfaceRecord *s = &fShapes[slot];
+        if (s->owner == owner && s->bufWidth == m->width && s->bufHeight == m->height) {
+            // An aliased mirror already contains the producer's rendering.
+            if (s->bufOffset == m->offset && s->bufRowBytes == m->stride) continue;
+            result = surfaceGpuTransfer(surfaceVramAddress(s->bufOffset), s->bufRowBytes,
+                surfaceVramAddress(m->offset), m->stride, m->width, m->height, 0, true, false);
+        }
+    }
+    // The caller's completion must include every mirror copy queued above.
+    *fence = fAccel.fence_emitted;
+    IOLockUnlock(fLock);
+    return result;
+}
+
+IOReturn RadeonNIUserClient::methodSurfaceGpuInfo(UInt32 wid,
+    struct rdn_user_surface_info *info, IOByteCount *size)
+{
+    if (!info || !size || *size < sizeof(*info)) return kIOReturnBadArgument;
+    IOReturn result = fAccel->surfaceGpuInfo(wid, fTask, fSurfaceCompositor, info);
+    if (result == kIOReturnSuccess) *size = sizeof(*info);
+    return result;
+}
+
+IOReturn RadeonNIUserClient::methodSurfaceGpuCopy(UInt32 wid, UInt32 offset,
+    UInt32 stride, UInt32 width, UInt32 height)
+{
+    IOLockLock(fAllocationLock);
+    IOReturn result = kIOReturnBadArgument;
+    bool owned = false;
+    for (UInt32 i = 0; i < fCount; ++i) if (fOffsets[i] == offset) owned = true;
+    if (!fSurfaceGpuFailed && owned && fAccel->surfaceDestination(offset, stride, width, height)) {
+        result = fAccel->surfaceGpuCopy(wid, fTask, fSurfaceCompositor,
+            offset, stride, width, height);
+        if (result == kIOReturnTimeout) fSurfaceGpuFailed = true;
+    }
+    IOLockUnlock(fAllocationLock);
+    return result;
+}
+
+IOReturn RadeonNIUserClient::methodFenceControl(UInt32 mode, UInt32 *active,
+                                                UInt32 *events, UInt32 *fallbacks)
+{
+	if (mode && !fUvdAdministrator) return kIOReturnNotPrivileged;
+	return fAccel->fenceControl(mode, active, events, fallbacks);
+}
+
+IOReturn RadeonNIUserClient::methodCommandInfo(UInt32 *version)
+{ *version = 1; return kIOReturnSuccess; }
+IOReturn RadeonNIUserClient::methodAllocCommand(UInt32 size, UInt32 align, UInt32 *offset)
+{ return allocateMemory(size, align, offset, false, false, true); }
+
+IOReturn RadeonNIUserClient::methodMemoryUsage(struct rdn_user_memory_usage *info,
+                                               IOByteCount *size)
+{
+ if (!fAccel) return kIOReturnNotReady;
+ if (*size < sizeof(*info)) return kIOReturnBadArgument;
+ fAccel->memoryUsage(info);
+ *size = sizeof(*info);
+ return kIOReturnSuccess;
+}
+
+IOReturn RadeonNIUserClient::methodSleepRehearsal(UInt32 action,UInt32 timeout,
+    struct rdn_user_sleep_rehearsal *out,IOByteCount *size)
+{
+    if(!out || !size || *size<sizeof(*out))return kIOReturnBadArgument;
+    if(action!=RDN_SLEEP_STATUS && action!=RDN_SLEEP_REHEARSE)return kIOReturnBadArgument;
+    if(action==RDN_SLEEP_REHEARSE && !fUvdAdministrator)return kIOReturnNotPrivileged;
+    IOReturn result=fAccel->sleepRehearsal(action,timeout,out);
+    if(result==kIOReturnSuccess)*size=sizeof(*out);
+    return result;
+}
+
+IOReturn RadeonNIAccel::sleepRehearsal(UInt32 action,UInt32 timeout,
+    struct rdn_user_sleep_rehearsal *out,struct rdn_user_sleep_maintenance *maintenance,struct rdn_user_sleep_resource *resource,void *backup)
+{
+    if(!out || (action!=RDN_SLEEP_STATUS && action!=RDN_SLEEP_REHEARSE))return kIOReturnBadArgument;
+    if(!fLock || !fFramebuffer)return kIOReturnNotReady;
+    if(action==RDN_SLEEP_STATUS) {
+        if(!IOLockTryLock(fLock))return kIOReturnBusy;
+        if(resource) {
+            *resource=fResourceReport;
+            resource->version=RDN_SLEEP_RESOURCE_VERSION;resource->size=sizeof(*resource);
+            if(!resource->maintenance.base.generation)resource->inventory_valid=resourceInventory(resource);
+        }
+        if(maintenance) {
+            if(!resource)*maintenance=fMaintenanceReport;
+            maintenance->version=RDN_SLEEP_MAINTENANCE_VERSION;
+            maintenance->size=sizeof(*maintenance);
+        } else *out=fSleepReport;
+        out->version=RDN_SLEEP_REHEARSAL_VERSION;out->size=sizeof(*out);
+        out->enabled=fFramebuffer->getProperty("EnableSleepRehearsal")==kOSBooleanTrue;
+        out->state=fQuiesce.phase;out->generation=fQuiesce.generation;
+        out->sleep_supported=0;out->power_retained=1;
+        IOLockUnlock(fLock);return kIOReturnSuccess;
+    }
+    if(!timeout || timeout>RDN_QUIESCE_MAX_MS)return kIOReturnBadArgument;
+    if(resource && (!maintenance || !backup || resource->owned_bytes!=4096))return kIOReturnBadArgument;
+    if(fFramebuffer->getProperty("EnableSleepRehearsal")!=kOSBooleanTrue)return kIOReturnUnsupported;
+    /* Same UVD -> accelerator -> framebuffer ordering as existing video paths.
+       Try-lock only: never wait for a competing owner to release a gate. */
+    if(!fUvdLock || !IOLockTryLock(fUvdLock))return kIOReturnBusy;
+    if(!IOLockTryLock(fLock)){IOLockUnlock(fUvdLock);return kIOReturnBusy;}
+    if(!fFramebuffer->tryPowerLock()){IOLockUnlock(fLock);IOLockUnlock(fUvdLock);return kIOReturnBusy;}
+    struct rdn_user_sleep_rehearsal report;
+    struct rdn_hang_regs regs;
+    UInt64 start=0,now=0;
+    int step=-1;
+    bool maintenancePaused=false;
+    if(maintenance){bzero(maintenance,sizeof(*maintenance));maintenance->version=RDN_SLEEP_MAINTENANCE_VERSION;maintenance->size=sizeof(*maintenance);}
+    bzero(&report,sizeof(report));bzero(&regs,sizeof(regs));
+    report.version=RDN_SLEEP_REHEARSAL_VERSION;report.size=sizeof(report);
+    report.enabled=1;report.power_retained=1;report.timeout_ms=timeout;
+    report.result=RDN_QUIESCE_UNSAFE;
+    /* This first stage refuses active video or clock/voltage policy. */
+    bool eligible=fEngineUp && !fRetiring && !fSurfaceGpuStalled && !fPowerFault &&
+        !fHardwarePower && !fIdleGovernor && !fClockTuning && !fFenceIRQEnabled && !fVideoBusy &&
+        !fUvdUp && !fUvd.prepared && !fUvdUsers && !fUvdLive &&
+        fAccel.card && fAccel.card->family==RDN_FAMILY_CAYMAN && fAccel.card->crtc_on &&
+        fAccel.submission_gate==&fQuiesce.phase && fQuiesce.phase==RDN_QUIESCE_RUNNING;
+    if(eligible && resource) {
+        resource->inventory_valid=resourceInventory(resource);
+        resource->allocation_valid=resource->owned_bytes==4096 && resourceAllocationValid(resource->owned_offset);
+        eligible=resource->inventory_valid && resource->allocation_valid && resource->private_connection;
+    }
+    if(eligible && maintenance) {
+        maintenancePaused=fFramebuffer->beginMaintenanceRehearsal();
+        eligible=maintenancePaused;
+    }
+    if(eligible && fFramebuffer->prepareRehearsalFan()==kIOReturnSuccess) {
+        report.fan_full_requested=1;
+        start=fAccel.card->os->time_ms(fAccel.card->os->cookie);
+        if(!rdn_quiesce_begin(&fQuiesce,start,timeout)) {
+            rdnStoreBarrier();
+            report.fence_before=fAccel.fence_emitted;report.wptr_before=fAccel.wptr;
+            report.busy_mask=rdn_cayman_hang_mask(&fAccel,&regs);report.rptr_before=regs.cp_rptr;
+            /* Exercise the real admission guard; no ring write or power hook
+               should be reached while the gate is closed. */
+            report.gate_verified=rdn_ring_begin(&fAccel,1)==-EBUSY;
+            if(report.gate_verified) {
+                do {
+                    now=fAccel.card->os->time_ms(fAccel.card->os->cookie);
+                    report.busy_mask=rdn_cayman_hang_mask(&fAccel,&regs);
+                    bool drained=!report.busy_mask && regs.cp_rptr==fAccel.wptr &&
+                        rdn_fence_done(&fAccel,report.fence_before);
+                    step=rdn_quiesce_poll(&fQuiesce,now,drained);
+                    if(!step)IOSleep(1);
+                } while(!step);
+                report.held_witness=step==1;
+                report.result=step==1?RDN_QUIESCE_OK:fQuiesce.result;
+            } else report.result=RDN_QUIESCE_INVARIANT;
+            if(maintenance && report.result==RDN_QUIESCE_OK) {
+                fFramebuffer->probeMaintenanceExclusion(maintenance);
+                if(!maintenance->cursor_excluded || !maintenance->fan_excluded ||
+                   !maintenance->hotplug_excluded || !maintenance->telemetry_excluded)
+                    report.result=RDN_QUIESCE_INVARIANT;
+                /* Bounded powered hold to exercise deferred cursor updates.
+                   Never wait for a timer/workloop while owning its data lock. */
+                UInt64 heldStart=fAccel.card->os->time_ms(fAccel.card->os->cookie);
+                for(unsigned n=0;n<20 && report.result==RDN_QUIESCE_OK;n++) {
+                    now=fAccel.card->os->time_ms(fAccel.card->os->cookie);
+                    if(now<heldStart){report.result=RDN_QUIESCE_CLOCK;break;}
+                    if(now-start>=timeout){report.result=RDN_QUIESCE_TIMEOUT;break;}
+                    if(now-heldStart>=20)break;
+                    IOSleep(1);
+                }
+                now=fAccel.card->os->time_ms(fAccel.card->os->cookie);
+                maintenance->hold_ms=now>=heldStart?(UInt32)(now-heldStart):0;
+                if(report.result==RDN_QUIESCE_OK) {
+                    if(now<heldStart || maintenance->hold_ms<20)report.result=RDN_QUIESCE_CLOCK;
+                    else if(now-start>=timeout)report.result=RDN_QUIESCE_TIMEOUT;
+                }
+            }
+            if(resource && report.result==RDN_QUIESCE_OK) {
+                if(!resourceSnapshot(resource,backup))report.result=RDN_QUIESCE_INVARIANT;
+                now=fAccel.card->os->time_ms(fAccel.card->os->cookie);
+                if(report.result==RDN_QUIESCE_OK) {
+                    if(now<start)report.result=RDN_QUIESCE_CLOCK;
+                    else if(now-start>=timeout)report.result=RDN_QUIESCE_TIMEOUT;
+                }
+            }
+            if(maintenance && report.result==RDN_QUIESCE_OK) {
+                report.busy_mask=rdn_cayman_hang_mask(&fAccel,&regs);
+                if(report.busy_mask || regs.cp_rptr!=fAccel.wptr ||
+                   !rdn_fence_done(&fAccel,report.fence_before))report.result=RDN_QUIESCE_INVARIANT;
+            }
+            report.rptr_after=regs.cp_rptr;
+            report.fence_after=fAccel.fence_emitted;report.wptr_after=fAccel.wptr;
+            report.queue_state_unchanged=report.fence_before==report.fence_after &&
+                report.wptr_before==report.wptr_after;
+            if(!report.queue_state_unchanged)report.result=RDN_QUIESCE_INVARIANT;
+            now=fAccel.card->os->time_ms(fAccel.card->os->cookie);
+            report.elapsed_ms=now>=start?(UInt32)(now-start):0;
+            /* No exit with admission closed; no reset, PCI power transition,
+               engine restart, allocation change or VRAM copy occurs. */
+            rdn_quiesce_reopen(&fQuiesce,report.result);rdnStoreBarrier();
+        }
+    }
+    if(maintenancePaused)fFramebuffer->endMaintenanceRehearsal(maintenance);
+    report.state=fQuiesce.phase;report.generation=fQuiesce.generation;
+    fSleepReport=report;*out=report;
+    if(maintenance)fMaintenanceReport=*maintenance;
+    if(resource)fResourceReport=*resource;
+    fFramebuffer->unlockPower();IOLockUnlock(fLock);IOLockUnlock(fUvdLock);
+    return kIOReturnSuccess;
+}
+
+IOReturn RadeonNIUserClient::methodSleepMaintenance(UInt32 action,UInt32 timeout,
+    struct rdn_user_sleep_maintenance *out,IOByteCount *size)
+{
+    if(!out || !size || *size<sizeof(*out))return kIOReturnBadArgument;
+    if(action!=RDN_SLEEP_STATUS && action!=RDN_SLEEP_REHEARSE)return kIOReturnBadArgument;
+    if(action==RDN_SLEEP_REHEARSE && !fUvdAdministrator)return kIOReturnNotPrivileged;
+    IOReturn result=fAccel->sleepRehearsal(action,timeout,&out->base,out);
+    if(result==kIOReturnSuccess)*size=sizeof(*out);
+    return result;
+}
+
+/* CPU metadata only. fLock must be held; this is not a persistence image. */
+bool RadeonNIAccel::resourceInventory(struct rdn_user_sleep_resource *out)
+{
+    struct rdn_mem_inventory visible,command,hidden;
+    bzero(&hidden,sizeof(hidden));
+    if(rdn_mem_inventory(&fMem,&visible) || rdn_mem_inventory(&fCommandMem,&command) ||
+       (fHiddenSize && rdn_mem_inventory(&fHidden,&hidden)))return false;
+    UInt64 capacity=fMem.size+fCommandMem.size+fHiddenSize;
+    if(capacity>fAccel.vram_size || fAccel.vram_size-capacity>0xffffffffu ||
+       visible.used_bytes>0xffffffffu || command.used_bytes>0xffffffffu || hidden.used_bytes>0xffffffffu)return false;
+    out->visible_allocations=visible.allocations;out->visible_used=(UInt32)visible.used_bytes;
+    out->command_allocations=command.allocations;out->command_used=(UInt32)command.used_bytes;
+    out->hidden_allocations=hidden.allocations;out->hidden_used=(UInt32)hidden.used_bytes;
+    out->reserved_bytes=(UInt32)(fAccel.vram_size-capacity);
+    UInt32 hash=(visible.fingerprint*16777619u^command.fingerprint)*16777619u^hidden.fingerprint;
+    out->gart_bindings=0;
+    for(unsigned i=0;i<kMaxGartBindings;i++)if(fGartBound[i].memory || fGartBound[i].vram) {
+        ++out->gart_bindings;
+        hash=(hash^i)*16777619u;hash=(hash^fGartBound[i].offset)*16777619u;
+        hash=(hash^fGartBound[i].size)*16777619u;hash=(hash^fGartBound[i].vram)*16777619u;
+    }
+    for(unsigned i=0;i<kSurfaceMirrors;i++)if(fSurfaceMirrors[i].surface) {
+        const SurfaceMirror *m=&fSurfaceMirrors[i];
+        hash=(hash^m->surface)*16777619u;hash=(hash^m->offset)*16777619u;
+        hash=(hash^m->stride)*16777619u;hash=(hash^m->width)*16777619u;hash=(hash^m->height)*16777619u;
+    }
+    hash=(hash^fAccel.ring_offset)*16777619u;hash=(hash^fAccel.ring_words)*16777619u;
+    hash=(hash^fAccel.fence_offset)*16777619u;hash=(hash^fAccel.fence_emitted)*16777619u;
+    hash=(hash^fAccel.wptr)*16777619u;hash=(hash^fGartTable)*16777619u;
+    out->topology_after=hash;
+    return true;
+}
+static void rdnSnapshotBarrier(void *)
+{
+    OSSynchronizeIO();rdnStoreBarrier();
+}
+bool RadeonNIAccel::resourceSnapshot(struct rdn_user_sleep_resource *out,void *backup)
+{
+    if(!out->allocation_valid || !out->private_connection || !backup || !fAccel.aperture ||
+       fQuiesce.phase!=RDN_QUIESCE_HELD_POWERED)return false;
+#ifdef RDN_SLEEP_INDEX_PROBE
+    /* Diagnostic builds only. The caller holds the allocation, UVD,
+       accelerator and framebuffer power locks, with maintenance excluded
+       and command processing drained. Never address anything except the
+       first 16 bytes of the validated connection-owned allocation. */
+    if(fFramebuffer->getProperty("EnableIndexedVramRehearsal")==kOSBooleanTrue) {
+        UInt8 indexed[16];
+        volatile UInt8 *visible=(volatile UInt8 *)(fAccel.aperture+out->owned_offset/4);
+        UInt32 mismatches=0;
+        OSSynchronizeIO();
+        if(rdn_vram_get(fAccel.card,out->owned_offset,indexed,sizeof(indexed))) {
+            IOLog("RadeonNI: indexed VRAM rehearsal read failed\n");
+            return false;
+        }
+        for(unsigned i=0;i<sizeof(indexed);i++)if(indexed[i]!=visible[i])++mismatches;
+        IOLog("RadeonNI: indexed VRAM rehearsal aperture comparison: %lu mismatched bytes of 16\n",(unsigned long)mismatches);
+        if(mismatches)return false;
+    }
+#endif
+    out->topology_before=out->topology_after;
+    struct rdn_snapshot_result result;
+    int error=rdn_snapshot_roundtrip(fAccel.aperture+out->owned_offset/4,(uint32_t *)backup,
+        RDN_SNAPSHOT_WORDS,rdnSnapshotBarrier,0,&result);
+    out->saved_words=result.saved;out->restored_words=result.restored;
+    out->restore_mismatches=result.restore_mismatches;out->poison_mismatches=result.poison_mismatches;
+    out->inventory_valid=resourceInventory(out);
+    out->metadata_unchanged=out->inventory_valid && out->topology_before==out->topology_after;
+    return !error && out->metadata_unchanged;
+}
+/* Diagnostic builds can read or write one aligned 16-byte chunk of a page
+ * owned by this client. Disabled entirely in normal driver builds. */
+IOReturn RadeonNIUserClient::methodSleepIndexHidden(UInt32 offset,void *out,IOByteCount *size)
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    (void)offset;(void)out;(void)size;return kIOReturnUnsupported;
+#else
+    bool writePattern=(offset&RDN_SLEEP_INDEX_WRITE)!=0;
+    offset &= ~RDN_SLEEP_INDEX_WRITE;
+    UInt32 page=offset&~4095u;
+    if(!out || !size || *size<16 || (offset&15) || !fAllocationLock)return kIOReturnBadArgument;
+    if(!fUvdAdministrator)return kIOReturnNotPrivileged;
+    if(!IOLockTryLock(fAllocationLock))return kIOReturnBusy;
+    bool owned=false;
+    for(UInt32 i=0;i<fCount;i++)if(fOffsets[i]==page)owned=true;
+    IOReturn result=kIOReturnBadArgument;
+    if(owned && !fSurfaceGpuFailed && !fWindowServerClient && !fUvdUser)
+        result=fAccel->sleepIndexHidden(offset,out,writePattern);
+    IOLockUnlock(fAllocationLock);
+    if(result==kIOReturnSuccess)*size=16;
+    return result;
+#endif
+}
+
+/* Restore only 16 bytes into this client's exact private hidden page. */
+IOReturn RadeonNIUserClient::methodSleepIndexRestore(UInt32 offset,UInt32 a,UInt32 b,UInt32 c,UInt32 d)
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    (void)offset;(void)a;(void)b;(void)c;(void)d;return kIOReturnUnsupported;
+#else
+    if((offset&15) || (offset&RDN_SLEEP_INDEX_WRITE) || !fAllocationLock)return kIOReturnBadArgument;
+    if(!fUvdAdministrator)return kIOReturnNotPrivileged;
+    if(!IOLockTryLock(fAllocationLock))return kIOReturnBusy;
+    UInt32 page=offset&~4095u,words[4]={a,b,c,d};UInt8 data[16],check[16];
+    bool owned=false;
+    for(UInt32 i=0;i<fCount;i++)if(fOffsets[i]==page)owned=true;
+    for(unsigned i=0;i<4;i++)for(unsigned j=0;j<4;j++)data[i*4+j]=(UInt8)(words[i]>>(24-8*j));
+    IOReturn result=kIOReturnBadArgument;
+    if(owned && !fSurfaceGpuFailed && !fWindowServerClient && !fUvdUser)
+        result=fAccel->sleepIndexHidden(offset,check,false,data);
+    IOLockUnlock(fAllocationLock);
+    return result;
+#endif
+}
+
+IOReturn RadeonNIAccel::sleepIndexHidden(UInt32 offset,void *out,bool writePattern,const UInt8 *restore)
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    (void)offset;(void)out;(void)writePattern;(void)restore;return kIOReturnUnsupported;
+#else
+    if(!out || !fUvdLock || !fLock || !fFramebuffer)return kIOReturnNotReady;
+    if(!IOLockTryLock(fUvdLock))return kIOReturnBusy;
+    if(!IOLockTryLock(fLock)){IOLockUnlock(fUvdLock);return kIOReturnBusy;}
+    if(!fFramebuffer->tryPowerLock()){IOLockUnlock(fLock);IOLockUnlock(fUvdLock);return kIOReturnBusy;}
+    IOReturn result=kIOReturnNotReady;
+    struct rdn_hang_regs regs;
+    bzero(&regs,sizeof(regs));
+    UInt32 page=offset&~4095u;
+    bool eligible=!(offset&15) && fFramebuffer->getProperty("EnableIndexedVramRehearsal")==kOSBooleanTrue &&
+        fEngineUp && !fRetiring && !fSurfaceGpuStalled && !fPowerFault && !fFenceIRQEnabled &&
+        !fHardwarePower && !fIdleGovernor && !fClockTuning &&
+        !fVideoBusy && !fUvdUp && !fUvd.prepared && !fUvdUsers && !fUvdLive &&
+        fAccel.card && fAccel.card->family==RDN_FAMILY_CAYMAN && fAccel.card->crtc_on &&
+        fQuiesce.phase==RDN_QUIESCE_RUNNING && fHiddenSize && page>=fHiddenOffset &&
+        (UInt64)page+4096<=(UInt64)fHiddenOffset+fHiddenSize &&
+        (UInt64)offset+16<=(UInt64)page+4096 && (UInt64)offset+16<=0x7ffffffcULL &&
+        rdn_mem_allocation_size(&fHidden,page)==4096;
+    if(eligible && !rdn_cayman_hang_mask(&fAccel,&regs) && regs.cp_rptr==fAccel.wptr &&
+       rdn_fence_done(&fAccel,fAccel.fence_emitted)) {
+        OSSynchronizeIO();
+        UInt8 pattern[16];
+        for(unsigned i=0;i<sizeof(pattern);i++)pattern[i]=(UInt8)(0xd3u^(i*13u)^((offset&4095u)>>4));
+        const UInt8 *input=restore?restore:(writePattern?pattern:0);
+        if(input && rdn_vram_put(fAccel.card,offset,input,sizeof(pattern)))
+            result=kIOReturnIOError;
+        else if(rdn_vram_get(fAccel.card,offset,out,16))result=kIOReturnIOError;
+        else if(input && memcmp(input,out,16))result=kIOReturnIOError;
+        else result=kIOReturnSuccess;
+    }
+    fFramebuffer->unlockPower();IOLockUnlock(fLock);IOLockUnlock(fUvdLock);
+    return result;
+#endif
+}
+
+/* Metadata-only diagnostic. No GPU reads, snapshot image, or power changes. */
+IOReturn RadeonNIUserClient::methodSleepLivePlan(struct rdn_user_live_plan *out,IOByteCount *size)
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    (void)out;(void)size;return kIOReturnUnsupported;
+#else
+    if(!out||!size||*size<sizeof(*out))return kIOReturnBadArgument;
+    if(!fUvdAdministrator)return kIOReturnNotPrivileged;
+    IOReturn result=fAccel->sleepLivePlan(out);
+    if(result==kIOReturnSuccess)*size=sizeof(*out);
+    return result;
+#endif
+}
+
+IOReturn RadeonNIAccel::sleepLivePlan(struct rdn_user_live_plan *out)
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    (void)out;return kIOReturnUnsupported;
+#else
+    if(!out||!fLock||!fFramebuffer)return kIOReturnBadArgument;
+    if(fFramebuffer->getProperty("EnableIndexedVramRehearsal")!=kOSBooleanTrue)return kIOReturnUnsupported;
+    const UInt32 cap=RDN_PLAN_MAX_RANGES;
+    const UInt32 rbytes=cap*sizeof(struct rdn_mem_range),sbytes=cap*sizeof(struct rdn_snapshot_span);
+    struct rdn_mem_range *ranges=(struct rdn_mem_range *)IOMalloc(rbytes);
+    if(!ranges)return kIOReturnNoMemory;
+    struct rdn_snapshot_span *spans=(struct rdn_snapshot_span *)IOMalloc(sbytes);
+    if(!spans){IOFree(ranges,rbytes);return kIOReturnNoMemory;}
+    struct rdn_live_plan_summary summary;
+    struct rdn_user_live_plan result;
+    bzero(&result,sizeof(result));
+    IOReturn status=kIOReturnNotReady;
+    IOLockLock(fLock);
+    if(fEngineUp&&!fRetiring&&fQuiesce.phase==RDN_QUIESCE_RUNNING&&
+       !rdn_live_plan_build(&fMem,&fCommandMem,fHiddenSize?&fHidden:0,
+             fAccel.vram_size,fAccel.aperture_size,ranges,spans,cap,&summary)) {
+        result.version=RDN_SLEEP_LIVE_PLAN_VERSION;result.size=sizeof(result);
+        result.range_count=summary.range_count;result.visible_allocations=summary.visible_allocations;
+        result.command_allocations=summary.command_allocations;result.hidden_allocations=summary.hidden_allocations;
+#define RDN_PLAN_PAIR(name,value) do{result.name##_lo=(UInt32)(value);result.name##_hi=(UInt32)((value)>>32);}while(0)
+        RDN_PLAN_PAIR(reserved,summary.reserved_bytes);RDN_PLAN_PAIR(visible,summary.visible_bytes);
+        RDN_PLAN_PAIR(command,summary.command_bytes);RDN_PLAN_PAIR(hidden,summary.hidden_bytes);
+        RDN_PLAN_PAIR(image,summary.image_bytes);
+#undef RDN_PLAN_PAIR
+        result.missing_mask=RDN_LIVE_MISSING_CONTENTS|RDN_LIVE_MISSING_GART|
+            RDN_LIVE_MISSING_DEVICE_STATE|RDN_LIVE_MISSING_CLIENT_METADATA;
+        result.content_saved=0;status=kIOReturnSuccess;
+    }
+    IOLockUnlock(fLock);
+    IOFree(spans,sbytes);IOFree(ranges,rbytes);
+    if(status==kIOReturnSuccess)*out=result;
+    return status;
+#endif
+}
+
+bool RadeonNIAccel::mappingProbeAllowed()
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    return false;
+#else
+    if(!fLock||!fFramebuffer)return false;
+    IOLockLock(fLock);
+    bool ok=fEngineUp&&!fRetiring&&fFramebuffer->getProperty("EnableIndexedVramRehearsal")==kOSBooleanTrue &&
+        !fMappingProbePoisoned;
+    IOLockUnlock(fLock);return ok;
+#endif
+}
+bool RadeonNIAccel::mappingProbeReserve()
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    return false;
+#else
+    if(!fLock||!fFramebuffer)return false;
+    IOLockLock(fLock);
+    bool ok=fEngineUp&&!fRetiring&&fFramebuffer->getProperty("EnableIndexedVramRehearsal")==kOSBooleanTrue &&
+        !fMappingProbeReserved && !fMappingProbePoisoned;
+    if(ok)fMappingProbeReserved=true;
+    IOLockUnlock(fLock);return ok;
+#endif
+}
+void RadeonNIAccel::mappingProbeActive(bool active)
+{
+#ifdef RDN_SLEEP_INDEX_PROBE
+    setProperty("RDNMappingProbeActive",active);
+#else
+    (void)active;
+#endif
+}
+void RadeonNIAccel::mappingProbePoison()
+{
+#ifdef RDN_SLEEP_INDEX_PROBE
+    IOLockLock(fLock);fMappingProbePoisoned=true;IOLockUnlock(fLock);
+    setProperty("RDNMappingProbePoisoned",true);
+#endif
+}
+void RadeonNIAccel::mappingProbeRelease()
+{
+#ifdef RDN_SLEEP_INDEX_PROBE
+    IOLockLock(fLock);fMappingProbeReserved=false;IOLockUnlock(fLock);
+#endif
+}
+IOReturn RadeonNIUserClient::methodSleepMappingProbe(UInt32 milliseconds,UInt32 *outcome)
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    (void)milliseconds;(void)outcome;return kIOReturnUnsupported;
+#else
+    if(!outcome||milliseconds!=400||!fAllocationLock||!fAccel)return kIOReturnBadArgument;
+    *outcome=0;
+    if(!fUvdAdministrator||!fProtocolV2||fWindowServerClient)return kIOReturnNotPrivileged;
+    IOLockLock(fAllocationLock);
+    if(!fMappingProbeMemory||!fMappingProbeMemory->getBytesNoCopy()) {
+        IOLockUnlock(fAllocationLock);return kIOReturnNotReady;
+    }
+    if(!fAccel->mappingProbeReserve()){IOLockUnlock(fAllocationLock);return kIOReturnBusy;}
+    /* This descriptor contains only fresh system RAM; it is never the BAR.
+       Synchronous bounded hold always attempts to remove the redirect. */
+    IOReturn enter=fMappingProbeMemory->redirect(kernel_task,true);
+    if(enter==kIOReturnSuccess){
+        *outcome|=1;fAccel->mappingProbeActive(true);
+        if(*(volatile UInt32 *)fMappingProbeMemory->getBytesNoCopy()==0x73ac19e5u)*outcome|=4;
+        IOSleep(milliseconds);
+    }
+    IOReturn leave=fMappingProbeMemory->redirect(kernel_task,false);
+    if(leave!=kIOReturnSuccess)fAccel->mappingProbePoison();
+    fAccel->mappingProbeActive(false);fAccel->mappingProbeRelease();
+    if(leave==kIOReturnSuccess)*outcome|=2;
+    IOLockUnlock(fAllocationLock);
+    return enter==kIOReturnSuccess&&leave==kIOReturnSuccess?kIOReturnSuccess:kIOReturnIOError;
+#endif
+}
+
+IOReturn RadeonNIUserClient::methodSleepMappingUniqueProbe(UInt32 milliseconds,UInt32 *outcome)
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    (void)milliseconds;(void)outcome;return kIOReturnUnsupported;
+#else
+    if(!outcome||milliseconds!=400||!fAllocationLock||!fAccel)return kIOReturnBadArgument;
+    *outcome=0;
+    if(!fUvdAdministrator||!fProtocolV2||fWindowServerClient)return kIOReturnNotPrivileged;
+    IOLockLock(fAllocationLock);
+    if(fMappingProbeMode!=2||!fMappingProbeMemory||!fMappingProbeUniqueMap) {
+        IOLockUnlock(fAllocationLock);return kIOReturnNotReady;
+    }
+    if(!fAccel->mappingProbeReserve()){IOLockUnlock(fAllocationLock);return kIOReturnBusy;}
+    /* Only this private system-RAM mapping is redirected. Do not touch its
+       backing bytes from the kernel while the redirect is active. */
+    IOReturn enter=fMappingProbeUniqueMap->redirect(0,0,0);
+    if(enter==kIOReturnSuccess){*outcome|=1;fAccel->mappingProbeActive(true);IOSleep(milliseconds);}
+    IOReturn leave=fMappingProbeUniqueMap->redirect(fMappingProbeMemory,0,0);
+    if(leave!=kIOReturnSuccess)fAccel->mappingProbePoison();
+    fAccel->mappingProbeActive(false);fAccel->mappingProbeRelease();
+    if(leave==kIOReturnSuccess)*outcome|=2;
+    IOLockUnlock(fAllocationLock);
+    return enter==kIOReturnSuccess&&leave==kIOReturnSuccess?kIOReturnSuccess:kIOReturnIOError;
+#endif
+}
+
+IOReturn RadeonNIUserClient::methodSleepMappingPhysicalProbe(UInt32 milliseconds,UInt32 *outcome)
+{
+#ifndef RDN_SLEEP_INDEX_PROBE
+    (void)milliseconds;(void)outcome;return kIOReturnUnsupported;
+#else
+    if(!outcome||milliseconds!=400||!fAllocationLock||!fAccel)return kIOReturnBadArgument;
+    *outcome=0;
+    if(!fUvdAdministrator||!fProtocolV2||fWindowServerClient)return kIOReturnNotPrivileged;
+    IOLockLock(fAllocationLock);
+    if(fMappingProbeMode!=3||!fPhysicalProbe.mapping){IOLockUnlock(fAllocationLock);return kIOReturnNotReady;}
+    if(!fAccel->mappingProbeReserve()){IOLockUnlock(fAllocationLock);return kIOReturnBusy;}
+    int enter=rdn_physical_probe_redirect(&fPhysicalProbe,true);
+    if(!enter){*outcome|=1;fAccel->mappingProbeActive(true);IOSleep(milliseconds);}
+    int leave=enter?-1:rdn_physical_probe_redirect(&fPhysicalProbe,false);
+    if(enter||leave)fAccel->mappingProbePoison();
+    fAccel->mappingProbeActive(false);fAccel->mappingProbeRelease();
+    if(!leave)*outcome|=2;
+    IOLockUnlock(fAllocationLock);
+    return !enter&&!leave?kIOReturnSuccess:kIOReturnIOError;
+#endif
+}
+
+IOReturn RadeonNIUserClient::methodSleepResource(UInt32 action,UInt32 timeout,UInt32 offset,UInt32 bytes,
+    struct rdn_user_sleep_resource *out,IOByteCount *size)
+{
+    if(!out || !size || *size<sizeof(*out) ||
+       (action!=RDN_SLEEP_STATUS && action!=RDN_SLEEP_REHEARSE))return kIOReturnBadArgument;
+    if(action==RDN_SLEEP_REHEARSE && !fUvdAdministrator)return kIOReturnNotPrivileged;
+    bzero(out,sizeof(*out));out->version=RDN_SLEEP_RESOURCE_VERSION;out->size=sizeof(*out);
+    if(action==RDN_SLEEP_STATUS) {
+        IOReturn result=fAccel->sleepRehearsal(action,timeout,&out->maintenance.base,&out->maintenance,out);
+        if(result==kIOReturnSuccess)*size=sizeof(*out);
+        return result;
+    }
+    if(bytes!=4096 || (offset&4095) || !fAllocationLock)return kIOReturnBadArgument;
+    if(!IOLockTryLock(fAllocationLock))return kIOReturnBusy;
+    /* The supplied probe opens a new connection and allocates exactly one page.
+       Never accept another connection's buffer or a subrange/interior offset. */
+    if(fCount!=1 || fOffsets[0]!=offset || fSurfaceGpuFailed || fWindowServerClient || fUvdUser) {
+        IOLockUnlock(fAllocationLock);return kIOReturnBadArgument;
+    }
+    void *backup=IOMalloc(4096);
+    if(!backup){IOLockUnlock(fAllocationLock);return kIOReturnNoMemory;}
+    out->owned_offset=offset;out->owned_bytes=bytes;out->private_connection=1;
+    IOReturn result=fAccel->sleepRehearsal(action,timeout,&out->maintenance.base,&out->maintenance,out,backup);
+    IOFree(backup,4096);IOLockUnlock(fAllocationLock);
+    if(result==kIOReturnSuccess)*size=sizeof(*out);
+    return result;
+}
+
+bool RadeonNIAccel::resourceAllocationValid(UInt32 offset)
+{
+    if((offset&4095) || offset>fAccel.aperture_size ||
+       4096>fAccel.aperture_size-offset || rdn_mem_allocation_size(&fMem,offset)!=4096)return false;
+    for(unsigned i=0;i<kMaxGartBindings;i++)if(fGartBound[i].vram==offset && offset)return false;
+    for(unsigned i=0;i<kSurfaceMirrors;i++)if(fSurfaceMirrors[i].surface && fSurfaceMirrors[i].offset==offset)return false;
+    for(unsigned i=0;i<fShapeCapacity;i++)if(fShapes[i].used && fShapes[i].bufWidth) {
+        UInt64 first=fShapes[i].bufOffset,last=first+(UInt64)fShapes[i].bufRowBytes*fShapes[i].bufHeight;
+        if(first<(UInt64)offset+4096 && offset<last)return false;
+    }
+    return true;
 }

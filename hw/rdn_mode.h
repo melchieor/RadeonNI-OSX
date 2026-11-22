@@ -66,6 +66,11 @@ bool rdn_edid_preferred_mode(const uint8_t *edid, struct rdn_mode *mode);
 int rdn_edid_modes(const uint8_t *edid, int len, struct rdn_mode *out, int max,
 		   int *preferred);
 
+/* Opt-in only: add CTA 1080p60 for the identified Apple 27-inch Cinema.
+ * Returns the new count; refuses mismatched, invalid or constrained EDIDs. */
+int rdn_edid_add_apple_cinema_1080p(const uint8_t *edid, int len,
+				   struct rdn_mode *out, int n, int max);
+
 /* True when the EDID carries an HDMI vendor block in a CEA extension. */
 bool rdn_edid_is_hdmi(const uint8_t *edid, int len);
 
@@ -88,6 +93,8 @@ bool rdn_output_is_duallink(struct rdn_card *card, const struct rdn_mode *mode);
  * needs. The card must be posted.
  */
 int rdn_output_detect(struct rdn_card *card, uint8_t *edid);
+int rdn_output_probe(struct rdn_card *card, const struct rdn_output *output, uint8_t *edid);
+int rdn_output_init(struct rdn_card *card);
 
 /*
  * Test aid, for a card with no display on it: select the DVI-I output as if a monitor had answered. The caller
@@ -96,14 +103,14 @@ int rdn_output_detect(struct rdn_card *card, uint8_t *edid);
 void rdn_output_assume(struct rdn_card *card);
 
 /*
- * One-time display setup after the card is posted and before the first
- * rdn_modeset(): transmitter initialisation and the display engine clock.
+ * One-time display setup after POST: initialize the board table's digital
+ * transmitters and the display engine clock. Fixed wiring is a Dell 7570 fallback.
  * Returns 0 or a negative errno value.
  */
 int rdn_display_init(struct rdn_card *card);
 
 /*
- * Set `mode` on CRTC 0 and drive it out of the selected output (the DVI-I
+ * Set `mode` on the selected CRTC and drive it out of the selected output (the DVI-I
  * connector's digital output if none was selected), scanning out `fb`. The
  * card must be posted and rdn_display_init() must have run. `hdmi` selects
  * HDMI rather than DVI signalling on the DVI-I connector; DisplayPort
@@ -129,7 +136,7 @@ int rdn_output_disable(struct rdn_card *card, const struct rdn_mode *mode,
 		       bool hdmi);
 
 /*
- * Write `count` entries of the colour table of CRTC 0 starting at `start`.
+ * Write `count` entries of the colour table of the selected CRTC starting at `start`.
  * The table maps 8-bit indices (8 bpp) or channel values (16 and 32 bpp) to
  * colours; rdn_modeset() loads a linear ramp.
  */

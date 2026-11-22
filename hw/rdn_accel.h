@@ -3,8 +3,8 @@
  *
  * Memory model: everything the GPU reads (ring, indirect buffers, vertex
  * data, shaders, textures) lives in video memory and is reached by the CPU
- * through the aperture (BAR0). There is no GART, no bus mastering and no
- * interrupt; completion is polled.
+ * through the aperture (BAR0). Completion uses register or VRAM fences;
+ * the kernel can enable interrupt-driven waits.
  *
  * Byte order: data (vertices, shaders, textures written by this library)
  * is stored little-endian by the accessors below, on any host. Command
@@ -45,6 +45,10 @@ struct rdn_gpu_config {
 	uint32_t tile_config;
 	uint32_t backend_map;
 	uint32_t active_simds;
+	uint32_t max_texture_channel_caches;
+	uint32_t mem_row_size_in_kb, shader_engine_tile_size;
+	uint32_t num_gpus, multi_gpu_tile_size, num_tile_pipes;
+	uint32_t mem_max_burst_length_bytes;
 };
 
 /* Microcode images as shipped (big-endian words). */
@@ -54,6 +58,9 @@ struct rdn_accel_fw {
 	const uint8_t *me;
 	size_t me_size;
 };
+
+struct rdn_accel;
+int rdn_rlc_start(struct rdn_accel *accel, const uint8_t *firmware, size_t size);
 
 struct rdn_accel {
 	struct rdn_card *card;
@@ -78,6 +85,12 @@ struct rdn_accel {
 	bool swapped;
 
 	uint32_t fence_emitted;
+	uint32_t fence_offset;
+	bool fence_memory, fence_interrupt;
+	int (*before_submit)(void *cookie);
+	void *submit_cookie;
+	/* Independent of clock policy; nonzero closes graphics ring admission. */
+	const volatile uint32_t *submission_gate;
 };
 
 static inline void rdn_vram_write32(struct rdn_accel *accel, uint32_t offset,
@@ -118,6 +131,28 @@ void rdn_accel_fini(struct rdn_accel *accel);
 
 /* rdn_gpu.c */
 void rdn_gpu_init(struct rdn_accel *accel);
+void rdn_cayman_gpu_init(struct rdn_accel *accel);
+void rdn_cayman_ring_setup(struct rdn_accel *accel);
+/*
+ * GPU hang recovery (Linux cayman_gpu_check_soft_reset/cayman_gpu_soft_reset,
+ * graphics blocks only). rdn_cayman_hang_mask returns RDN_HANG_* bits for the
+ * engines that report work in progress; rdn_accel_recover halts the CP, resets
+ * the busy graphics blocks, marks every emitted fence complete, reloads the
+ * microcode and restarts the ring. The memory controller, GART, RLC, display
+ * and UVD are left alone. Returns 0 when the ring test passes afterwards.
+ */
+#define RDN_HANG_GFX	(1u << 0)
+#define RDN_HANG_CP	(1u << 1)
+#define RDN_HANG_GRBM	(1u << 2)
+#define RDN_HANG_DMA	(1u << 3)
+#define RDN_HANG_DMA1	(1u << 4)
+struct rdn_hang_regs { uint32_t grbm_status, grbm_se0, grbm_se1, srbm_status, cp_rptr, cp_wptr, fence; };
+uint32_t rdn_cayman_hang_mask(struct rdn_accel *accel, struct rdn_hang_regs *regs);
+void rdn_cayman_soft_reset(struct rdn_accel *accel, uint32_t mask);
+int rdn_accel_recover(struct rdn_accel *accel, const struct rdn_accel_fw *fw,
+		      uint32_t *mask_before, uint32_t *mask_after);
+uint32_t rdn_remap_render_backend(uint32_t pipes, uint32_t max_rb,
+				uint32_t total_rb, uint32_t disabled);
 
 /*
  * Flush the card's cache of host accesses to video memory: needed after
@@ -163,6 +198,23 @@ int rdn_ib_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
 /* Caller holds the ring lock. No waits; any error leaves ring, fence and seq unchanged. */
 int rdn_ib_try_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
 		     uint32_t *seq);
+
+#ifdef RDN_SLEEP_INTERNAL_EXPERIMENT
+struct rdn_quiesce;
+struct rdn_stage;
+struct rdn_gart;
+struct rdn_sleep_ib_ticket { uint32_t generation, offset, bytes, used; };
+struct rdn_sleep_gart_ib_ticket { uint32_t generation, used; };
+/* Prototype for host testing, not an authorization boundary. Caller MUST hold
+ * the ring/allocator locks, own and pin this IB, and prove its commands safe.
+ * A ticket is single-use. Completion, timeout and quarantine are separate. */
+int rdn_ib_try_submit_sleep(struct rdn_accel *, const struct rdn_quiesce *,
+                            struct rdn_sleep_ib_ticket *, uint32_t words, uint32_t *seq);
+/* Caller keeps the stage private, mapped, locked and immutable to the fence. */
+int rdn_ib_try_submit_sleep_gart(struct rdn_accel *,const struct rdn_quiesce *,
+ struct rdn_sleep_gart_ib_ticket *,struct rdn_stage *,struct rdn_gart *,
+ int (*stage_matches)(void *,struct rdn_stage *,struct rdn_gart *),void *,uint32_t,uint32_t *);
+#endif
 
 /*
  * rdn_blit.c: copy rectangles from one surface to another with the 3D

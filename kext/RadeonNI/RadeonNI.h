@@ -22,6 +22,7 @@
 extern "C" {
 #include "rdn_accel.h"
 #include "rdn_card.h"
+#include "rdn_fan.h"
 #include "rdn_cursor.h"
 #include "rdn_i2c.h"
 #include "rdn_mc.h"
@@ -31,6 +32,7 @@ extern "C" {
 }
 
 class RadeonNIAccel;
+struct rdn_user_board_sensors;
 
 class RadeonNI : public IOFramebuffer
 {
@@ -100,23 +102,44 @@ public:
 	virtual IOReturn setCursorState(SInt32 x, SInt32 y, bool visible);
 
 	/* Register access for the OS layer. */
+	IOReturn readTelemetry(bool clocks,UInt32 *temperature,UInt32 *core,UInt32 *memory);
+	IOReturn readBoardSensors(struct rdn_user_board_sensors *out);
 	UInt32 readReg(UInt32 offset);
 	void writeReg(UInt32 offset, UInt32 value);
 	IOPCIDevice *device() { return fDevice; }
 
 	/* For the accelerator. */
 	struct rdn_card *card() { return &fCard; }
+	bool tryPowerLock() { return fLock && IOLockTryLock(fLock); }
+ void lockPower() { IOLockLock(fLock); }
+	void unlockPower() { IOLockUnlock(fLock); }
+    /* Caller holds the power lock; no device-power operation. */
+    IOReturn prepareRehearsalFan();
+    /* Caller holds fLock. Cursor exclusion uses a short interrupt-safe lock. */
+    bool beginMaintenanceRehearsal();
+    void probeMaintenanceExclusion(struct rdn_user_sleep_maintenance *);
+    void endMaintenanceRehearsal(struct rdn_user_sleep_maintenance *);
 	struct rdn_os *os() { return &fOS; }
 	volatile void *aperture();
 	UInt32 apertureSize();
 	IOMemoryDescriptor *apertureDescriptor();
 	/* What is on screen now, at any depth; false before the first mode. */
 	bool screen(struct rdn_fb *fb);
+	bool screenAt(UInt32 index, struct rdn_fb *fb);
 	/* The screen as a render target; false unless it is 32 bits deep. */
 	bool selftestTarget(struct rdn_accel *accel,
 			    struct rdn_selftest_target *target);
 
 private:
+	RadeonNI *fParent, *fHeads[RDN_NUM_CRTC];
+	struct rdn_card *fDisplayCards[RDN_NUM_CRTC];
+	struct rdn_output fHeadOutput;
+	UInt32 fScanoutOffset, fCursorOffset, fHeadIndex, fHeadPll;
+	bool fMultiHead, fHeadAllocation, fAcceleratorClaimed;
+	UInt32 fAcceleratorIndex;
+	bool startHead(IOService *provider);
+	void startHeads();
+	void linkHeadAccelerator();
 	IOPCIDevice *fDevice;
 	IOMemoryMap *fRegMap;
 	IOMemoryMap *fFbMap;
@@ -127,7 +150,7 @@ private:
 	RadeonNIAccel *fAccel;
 	bool fModeSet;
 	bool fMCRebaseRequested, fMCProviderLocked, fMCProviderOpen;
-	bool fMCConsoleSuspended, fMCRebased, fMCFatal;
+	bool fMCConsoleSuspended, fMCConsoleOwned, fMCRebased, fMCFatal;
 
 	struct rdn_os fOS;
 	struct rdn_card fCard;
@@ -147,6 +170,12 @@ private:
 	bool fHWCursor, fCursorLoaded, fCursorVisible, fCursorLogged;
 	SInt32 fCursorX, fCursorY;
 	UInt32 fCursorData[RDN_CURSOR_SIZE * RDN_CURSOR_SIZE];
+    IOSimpleLock *fCursorLock;
+    bool fCursorPaused,fCursorImagePending,fCursorConverting,fCursorHidePending;
+    UInt32 fCursorDeferred;
+    volatile UInt32 fFanPollExcluded,fHotplugPollExcluded;
+    UInt32 fCursorUpload[RDN_CURSOR_SIZE * RDN_CURSOR_SIZE];
+    void commitCursorLocked();
 
 	/* What is on screen now. */
 	IODisplayModeID fCurrentMode;
@@ -176,6 +205,14 @@ private:
 	UInt32 fPowerState;
 	bool fPowerRegistered;
 	int fSenseLast, fSenseSteady;
+    IOWorkLoop *fFanLoop;
+    IOTimerEventSource *fFanTimer;
+    struct rdn_fan_policy fFanPolicy;
+    bool fFanWriteFault;
+    void startTemperatureFanControl();
+    void stopTemperatureFanControl();
+    void pollTemperatureFan();
+    static void fanTimerFired(OSObject *, IOTimerEventSource *);
 	IOWorkLoop *fPollLoop;
 	IOTimerEventSource *fPollTimer;
 	IOWorkLoop *fNoticeLoop;
@@ -209,6 +246,7 @@ private:
 	void describeFb(const struct rdn_mode *mode, IOIndex depth,
 			struct rdn_fb *fb);
 	IOReturn programMode(IODisplayModeID id, IOIndex depth);
+ IOReturn programModeHardware(IODisplayModeID id, IOIndex depth);
 	bool useHDMI();
 	void loadColors();
 	void cleanUp();
